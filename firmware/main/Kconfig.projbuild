@@ -9,6 +9,29 @@ config STACKCHAN_SERVER_URL
         /stackChan/apps and /stackChan/ws from this base. Override in your
         sdkconfig.defaults.local to point at a self-hosted deployment.
 
+config STACKCHAN_OTA_URL
+    string "Self-hosted firmware OTA check URL"
+    default ""
+    help
+        Distribution endpoint for self-built firmware. On "Check for Updates"
+        (Setup -> Firmware) the device POSTs its system-info JSON here and the
+        server must reply with:
+            { "firmware": { "version": "1.2.3", "url": "http://.../app.bin" } }
+        The device upgrades when "version" differs from the running build, so the
+        "already up to date" check, progress bar and A/B rollback protection are
+        all preserved.
+
+        Point this at your own server to serve firmware instead of the public
+        Xiaozhi cloud (CONFIG_OTA_URL). A Tailnet address such as
+        http://100.102.53.22:8787/ota/check works directly: when Tailscale is
+        provisioned (NVS namespace "tscale") the OTA flow brings the tunnel up and
+        lwIP routes 100.64.0.0/10 over WireGuard, so plain http:// over the tailnet
+        needs no TLS. Include the ":port" so the WireGuard session is primed.
+
+        Empty (the default) -> fall back to CONFIG_OTA_URL (behaviour unchanged).
+        Override in your sdkconfig.defaults.local, e.g.:
+            CONFIG_STACKCHAN_OTA_URL="http://100.102.53.22:8787/ota/check"
+
 endmenu
 
 menu "Xiaozhi Assistant"
