@@ -47,7 +47,7 @@ extern "C" void app_main(void)
 
             GetMooncake().update();
 
-            if (GetHAL().isXiaozhiStartRequested()) {
+            if (GetHAL().isXiaozhiStartRequested() || GetHAL().isAgentStartRequested()) {
                 break;
             }
         }
@@ -57,6 +57,11 @@ extern "C" void app_main(void)
         DestroyMooncake();
     }
 
-    // Start xiaozhi, never returns
-    GetHAL().startXiaozhi();
+    // Hand control to the AI engine (never returns). The AI.AGENT app launches
+    // our self-implemented engine; the legacy xiaozhi path is kept as a fallback.
+    if (GetHAL().isAgentStartRequested()) {
+        GetHAL().startCustomAgent();
+    } else {
+        GetHAL().startXiaozhi();
+    }
 }

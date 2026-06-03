@@ -202,6 +202,17 @@ void Hal::startXiaozhi()
     hal_bridge::start_xiaozhi_app();
 }
 
+#include <agent/agent.h>
+
+void Hal::startCustomAgent()
+{
+    mclog::tagInfo(_tag, "start custom agent");
+
+    // The custom engine sets up motion, the avatar and its own update task, then
+    // runs the capture/response loop forever (it does not return).
+    custom_agent::start();
+}
+
 XiaozhiConfig_t Hal::getXiaozhiConfig()
 {
     auto bridge_config = hal_bridge::get_xiaozhi_config();

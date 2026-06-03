@@ -215,6 +215,19 @@ public:
     XiaozhiConfig_t getXiaozhiConfig();
     void setXiaozhiConfig(XiaozhiConfig_t config);
 
+    /* ------------------------------ Custom Agent ------------------------------ */
+    // Self-implemented AI agent engine (replaces xiaozhi). Reuses the StackChan
+    // face / motion / head-pet subsystem and talks to our own backend over WS.
+    void requestAgentStart()
+    {
+        _agent_start_requested = true;
+    }
+    bool isAgentStartRequested()
+    {
+        return _agent_start_requested;
+    }
+    void startCustomAgent();
+
     /* ----------------------------------- BLE ---------------------------------- */
     uitk::Signal<const char*> onBleMotionData;
     uitk::Signal<const char*> onBleAvatarData;
@@ -303,6 +316,7 @@ public:
 
 private:
     bool _xiaozhi_start_requested = false;
+    bool _agent_start_requested   = false;
 
     void xiaozhi_board_init();
     void lvgl_init();
