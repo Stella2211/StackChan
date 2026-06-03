@@ -29,6 +29,14 @@ extern "C" void app_main(void)
     const bool skip_mooncake =
         GetHAL().getXiaozhiConfig().startAiAgentOnBoot && GetHAL().getWarmRebootTarget() < 0;
 
+    if (skip_mooncake) {
+        // Boot-straight-to-AI: the launcher (and therefore the AI.AGENT app that
+        // would otherwise call requestAgentStart()) never runs in this path. Request
+        // the custom engine here so we don't fall through to the legacy xiaozhi
+        // engine below. Mirrors AppAiAgent::onOpen().
+        GetHAL().requestAgentStart();
+    }
+
     if (!skip_mooncake) {
         // Install apps
         GetMooncake().installApp(std::make_unique<AppLauncher>());

@@ -85,6 +85,10 @@ private:
     BackendCallbacks cb_;
     std::atomic<bool> connected_{false};
     std::atomic<bool> ready_{false};
+    // Cleared at the start of close() so the WS receive task stops dispatching into
+    // cb_ before ws_ is torn down (defense-in-depth against a teardown/callback race
+    // on reconnect). Checked at the top of every ws_ handler.
+    std::atomic<bool> alive_{true};
     AudioMime current_mime_ = AudioMime::Unknown;
 };
 

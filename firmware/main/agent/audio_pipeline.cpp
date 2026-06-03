@@ -81,8 +81,11 @@ bool AudioPipeline::captureFrame16k(std::vector<int16_t>& out)
         return false;
     }
 
-    // Read interleaved frames. InputData() reads readBuf_.size() int16 samples
-    // (Read/Write themselves are protected on AudioCodec).
+    // Read interleaved frames. InputData() reads readBuf_.size() int16 samples.
+    // Capture (this task) and playback (playTask) hit the codec concurrently, but
+    // CoreS3 is full-duplex (separate I2S in/out devices) so read and write don't
+    // contend. NOTE: AudioCodec itself does not lock — a future half-duplex board
+    // would need InputData/OutputData guarded by a mutex.
     if (!codec_->InputData(readBuf_)) {
         return false;
     }

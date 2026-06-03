@@ -158,6 +158,10 @@ bool tailscale_bring_up(const Config& cfg, const std::function<void(const char*)
 
     if (microlink_start(g_ml) != ESP_OK) {
         mclog::tagError(_tag, "microlink_start failed -> falling back to direct connect");
+        // Don't leave a half-initialized handle behind: the re-entry guard keys off
+        // g_ml != nullptr, so a stale handle would later report "already up".
+        microlink_destroy(g_ml);
+        g_ml = nullptr;
         status("Tailscale 起動失敗");
         return true;
     }

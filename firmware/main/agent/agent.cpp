@@ -107,18 +107,33 @@ static void update_task(void*)
 /* -------------------------------------------------------------------------- */
 
 // Locate the start of PCM samples inside the first chunk of a WAV segment by
-// finding the "data" sub-chunk. Returns 0 if it doesn't look like a WAV.
+// walking the RIFF chunk list to the "data" sub-chunk. Returns 0 if it doesn't
+// look like a WAV (RIFF/WAVE) so the caller plays the bytes unchanged. Robust to
+// LIST/fact chunks preceding "data".
 static size_t wav_data_offset(const uint8_t* data, size_t len)
 {
-    if (len < 12 || std::memcmp(data, "RIFF", 4) != 0) {
-        return 0;
+    if (len < 12 || std::memcmp(data, "RIFF", 4) != 0 || std::memcmp(data + 8, "WAVE", 4) != 0) {
+        return 0;  // not a WAV
     }
-    for (size_t i = 12; i + 8 <= len; ++i) {
+    // Each sub-chunk is [4-byte id][4-byte LE size][payload], word-aligned.
+    for (size_t i = 12; i + 8 <= len;) {
+        const uint32_t sz = static_cast<uint32_t>(data[i + 4]) | (static_cast<uint32_t>(data[i + 5]) << 8) |
+                            (static_cast<uint32_t>(data[i + 6]) << 16) | (static_cast<uint32_t>(data[i + 7]) << 24);
         if (std::memcmp(data + i, "data", 4) == 0) {
-            return i + 8;  // skip "data" + 4-byte size
+            return i + 8;  // PCM payload starts right after the data header
         }
+        // Advance to the next (word-aligned) chunk. advance is >= 8 for any valid
+        // size, so i strictly increases and the loop always terminates (bounded by
+        // i + 8 <= len). A sub-8 result can only come from a 32-bit overflow on a
+        // garbage size field; stop in that case (defensive — the backend's WAVs are
+        // well-formed).
+        const size_t advance = static_cast<size_t>(8) + sz + (sz & 1u);
+        if (advance < 8) {
+            break;
+        }
+        i += advance;
     }
-    return 44;  // canonical WAV header fallback
+    return 44;  // valid WAV but 'data' not in this chunk: assume canonical header
 }
 
 /* -------------------------------------------------------------------------- */
@@ -141,7 +156,9 @@ static void wire_callbacks()
 
     cb.onDisconnected = []() {
         g_audio.flushPlayback();
-        g_state = State::Idle;
+        g_state         = State::Idle;
+        g_turnComplete  = false;
+        g_speakingShown = false;
         faceSpeech("system", "切断されました");
     };
 
@@ -239,15 +256,15 @@ static int mean_abs(const std::vector<int16_t>& frame)
 
 static void capture_loop()
 {
-    constexpr int kFrameMs       = AudioPipeline::kFrameMs;  // 20
-    constexpr int kOnsetDebounce = 80;                       // ms over threshold to commit onset
-    const int prerollFrames      = 300 / kFrameMs;           // ~300ms pre-roll
+    constexpr int kFrameMs  = AudioPipeline::kFrameMs;  // 20
+    const int prerollFrames = 300 / kFrameMs;           // ~300ms pre-roll
 
     std::deque<std::vector<int16_t>> preroll;
     std::vector<int16_t> frame;
-    int onsetMs   = 0;
-    int speechMs  = 0;
-    int silenceMs = 0;
+    int onsetMs    = 0;  // accumulated voiced time of a tentative onset
+    int onsetGapMs = 0;  // trailing gap within a tentative onset (cancels it if long)
+    int speechMs   = 0;
+    int silenceMs  = 0;
 
     while (1) {
         // Reading paces this loop at ~one frame per kFrameMs (codec is real-time).
@@ -257,9 +274,15 @@ static void capture_loop()
         }
 
         if (g_client == nullptr || !g_client->isConnected()) {
-            if (!connect_with_retry()) {
-                continue;
-            }
+            connect_with_retry();
+            // Fresh connection: drop any half-built capture state so the first
+            // post-reconnect utterance doesn't inherit stale pre-roll / VAD counters.
+            preroll.clear();
+            onsetMs    = 0;
+            onsetGapMs = 0;
+            speechMs   = 0;
+            silenceMs  = 0;
+            continue;
         }
         if (!g_client->isReady()) {
             continue;
@@ -275,20 +298,42 @@ static void capture_loop()
                 }
 
                 preroll.push_back(frame);
-                while (static_cast<int>(preroll.size()) > prerollFrames) {
+
+                // Accumulate voiced time of a tentative onset. Brief intra-word dips
+                // (still above vadKeepRms) keep building; only a sustained gap
+                // (>= vadSilenceMs) cancels the onset. This is what discards short
+                // blips (coughs/clicks) that never reach vadMinSpeechMs.
+                if (energy >= g_cfg.vadStartRms) {
+                    onsetMs += kFrameMs;
+                    onsetGapMs = 0;
+                } else if (onsetMs > 0) {
+                    if (energy >= g_cfg.vadKeepRms) {
+                        onsetMs += kFrameMs;
+                        onsetGapMs = 0;
+                    } else {
+                        onsetGapMs += kFrameMs;
+                        if (onsetGapMs >= g_cfg.vadSilenceMs) {
+                            onsetMs    = 0;  // tentative onset was just noise
+                            onsetGapMs = 0;
+                        }
+                    }
+                }
+
+                // Until an onset is building, keep only the rolling pre-roll window.
+                // While it builds, retain the whole head so nothing is lost on commit
+                // (bounded so a never-committing case can't grow without limit).
+                const int headCap = prerollFrames + g_cfg.vadMinSpeechMs / kFrameMs + 4;
+                const int trimTo  = (onsetMs > 0) ? headCap : prerollFrames;
+                while (static_cast<int>(preroll.size()) > trimTo) {
                     preroll.pop_front();
                 }
 
-                if (energy >= g_cfg.vadStartRms) {
-                    onsetMs += kFrameMs;
-                } else {
-                    onsetMs = 0;
-                }
-
-                if (onsetMs >= kOnsetDebounce) {
-                    // Speech onset confirmed: open the utterance and flush pre-roll.
+                // Commit only once enough voiced audio has accumulated. Gating on
+                // vadMinSpeechMs (not a short debounce) rejects sub-threshold noises.
+                if (onsetMs >= g_cfg.vadMinSpeechMs) {
                     if (!g_client->sendInputAudioStart()) {
-                        onsetMs = 0;
+                        onsetMs    = 0;
+                        onsetGapMs = 0;
                         break;
                     }
                     faceStatus(Lang::Strings::LISTENING);
@@ -299,10 +344,11 @@ static void capture_loop()
                     }
                     preroll.clear();
                     // The pre-roll already contains the onset frames.
-                    speechMs  = flushed * kFrameMs;
-                    silenceMs = 0;
-                    onsetMs   = 0;
-                    g_state   = State::Capturing;
+                    speechMs   = flushed * kFrameMs;
+                    silenceMs  = 0;
+                    onsetMs    = 0;
+                    onsetGapMs = 0;
+                    g_state    = State::Capturing;
                 }
                 break;
             }
@@ -337,7 +383,11 @@ static void capture_loop()
                 if (g_turnComplete.load() && !g_audio.isPlaying()) {
                     g_state = State::Idle;
                     faceStatus(Lang::Strings::STANDBY);
-                    onsetMs = 0;
+                    // Start the next utterance from a clean slate (no stale pre-roll
+                    // captured during the previous turn / response tail).
+                    preroll.clear();
+                    onsetMs    = 0;
+                    onsetGapMs = 0;
                 }
                 break;
             }
