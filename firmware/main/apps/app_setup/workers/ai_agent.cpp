@@ -6,6 +6,7 @@
 #include "workers.h"
 #include <mooncake_log.h>
 #include <hal/hal.h>
+#include <agent/agent_config.h>
 #include <array>
 #include <vector>
 
@@ -265,4 +266,101 @@ void XiaozhiGeneralWorker::update()
 void XiaozhiGeneralWorker::update_idle_motion_label()
 {
     _label_idle_motion_value->setText(_idle_motion_level_labels[_config.idleRandomMovementLevel]);
+}
+
+AgentBackendWorker::AgentBackendWorker()
+{
+    mclog::info("AgentBackendWorker start");
+
+    _config  = custom_agent::load_config();
+    _live_on = (_config.route == custom_agent::Route::Live);
+
+    _panel = std::make_unique<Container>(lv_screen_active());
+    _panel->setBgColor(lv_color_hex(0xEDF4FF));
+    _panel->align(LV_ALIGN_CENTER, 0, 0);
+    _panel->setBorderWidth(0);
+    _panel->setSize(320, 240);
+    _panel->setRadius(0);
+    _panel->setPadding(0, 50, 24, 18);
+    _panel->setScrollDir(LV_DIR_VER);
+    _panel->setScrollbarMode(LV_SCROLLBAR_MODE_ACTIVE);
+
+    _panel_backend = std::make_unique<Container>(_panel->get());
+    _panel_backend->setSize(296, 206);
+    _panel_backend->align(LV_ALIGN_TOP_MID, 0, 20);
+    _panel_backend->setBgColor(lv_color_hex(0xD2E3FF));
+    _panel_backend->setBorderWidth(0);
+    _panel_backend->setRadius(18);
+    _panel_backend->setPadding(0, 0, 0, 0);
+    _panel_backend->removeFlag(LV_OBJ_FLAG_SCROLLABLE);
+
+    _label_title = std::make_unique<Label>(_panel_backend->get());
+    _label_title->setText("AI Agent backend:");
+    _label_title->setTextFont(&lv_font_montserrat_16);
+    _label_title->setTextColor(lv_color_hex(0x26206A));
+    _label_title->setWidth(260);
+    _label_title->setTextAlign(LV_TEXT_ALIGN_CENTER);
+    _label_title->align(LV_ALIGN_TOP_MID, 0, 16);
+
+    _label_value = std::make_unique<Label>(_panel_backend->get());
+    _label_value->setTextFont(&lv_font_montserrat_24);
+    _label_value->setTextColor(lv_color_hex(0x26206A));
+    _label_value->setWidth(280);
+    _label_value->setTextAlign(LV_TEXT_ALIGN_CENTER);
+    _label_value->align(LV_ALIGN_TOP_MID, 0, 52);
+
+    _switch_live = std::make_unique<Switch>(_panel_backend->get());
+    _switch_live->setSize(64, 36);
+    _switch_live->align(LV_ALIGN_TOP_MID, 0, 100);
+    _switch_live->setBgColor(lv_color_hex(0xB8D3FD), LV_PART_MAIN);
+    _switch_live->setBgColor(lv_color_hex(0x615B9E), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    _switch_live->setBgColor(lv_color_hex(0xFFFFFF), LV_PART_KNOB);
+    _switch_live->setValue(_live_on);
+    _switch_live->onValueChanged().connect([this](bool value) {
+        _live_on     = value;
+        _label_dirty = true;
+    });
+
+    _label_hint = std::make_unique<Label>(_panel_backend->get());
+    _label_hint->setText("Off: Agent (VoiceVox)\nOn: Live (Gemini)");
+    _label_hint->setTextFont(&lv_font_montserrat_16);
+    _label_hint->setTextColor(lv_color_hex(0x615B9E));
+    _label_hint->setWidth(260);
+    _label_hint->setTextAlign(LV_TEXT_ALIGN_CENTER);
+    _label_hint->align(LV_ALIGN_TOP_MID, 0, 146);
+
+    _btn_confirm = std::make_unique<Button>(_panel->get());
+    apply_button_common_style(*_btn_confirm);
+    _btn_confirm->align(LV_ALIGN_TOP_MID, 0, 240);
+    _btn_confirm->setSize(290, 50);
+    _btn_confirm->label().setText("Confirm");
+    _btn_confirm->onClick().connect([this]() { _confirm_flag = true; });
+
+    update_value_label();
+}
+
+void AgentBackendWorker::update()
+{
+    if (_label_dirty) {
+        _label_dirty = false;
+        update_value_label();
+    }
+
+    if (_confirm_flag) {
+        _confirm_flag = false;
+        _config.route = _live_on ? custom_agent::Route::Live : custom_agent::Route::Agent;
+        custom_agent::save_config(_config);
+        mclog::tagInfo(_tag, "agent backend route updated: {} (/ws/{})", _live_on ? "Live" : "Agent",
+                       custom_agent::route_name(_config.route));
+        _is_done = true;
+    }
+}
+
+void AgentBackendWorker::update_value_label()
+{
+    if (_live_on) {
+        _label_value->setText("Live  /ws/live");
+    } else {
+        _label_value->setText("Agent  /ws/agent");
+    }
 }

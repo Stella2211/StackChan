@@ -78,6 +78,12 @@ void AppSetup::onOpen()
                   _need_warm_reset = true;
                   _worker          = std::make_unique<XiaozhiGeneralWorker>();
               }},
+             {"Backend",
+              [&]() {
+                  _destroy_menu    = true;
+                  _need_warm_reset = true;
+                  _worker          = std::make_unique<AgentBackendWorker>();
+              }},
              {"Power Saving",
               [&]() {
                   _destroy_menu    = true;

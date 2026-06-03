@@ -8,6 +8,7 @@
 #include <smooth_lvgl.hpp>
 #include <uitk/short_namespace.hpp>
 #include <hal/hal.h>
+#include <agent/agent_config.h>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -353,6 +354,35 @@ private:
     std::vector<uint8_t> _idle_motion_levels;
     int32_t _pending_idle_motion_index = -1;
     bool _confirm_flag                 = false;
+};
+
+/**
+ * @brief Select which custom AI agent backend endpoint to use.
+ *        Switch on  -> Live  (/ws/live)
+ *        Switch off -> Agent (/ws/agent)
+ *        The route is persisted to NVS (custom_agent::save_config) and read by
+ *        the agent at startup, so a warm reboot is needed to apply the change.
+ */
+class AgentBackendWorker : public WorkerBase {
+public:
+    AgentBackendWorker();
+    void update() override;
+
+private:
+    void update_value_label();
+
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel;
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel_backend;
+    std::unique_ptr<uitk::lvgl_cpp::Label> _label_title;
+    std::unique_ptr<uitk::lvgl_cpp::Label> _label_value;
+    std::unique_ptr<uitk::lvgl_cpp::Label> _label_hint;
+    std::unique_ptr<uitk::lvgl_cpp::Switch> _switch_live;
+    std::unique_ptr<uitk::lvgl_cpp::Button> _btn_confirm;
+
+    custom_agent::Config _config;
+    bool _live_on      = false;
+    bool _label_dirty  = true;
+    bool _confirm_flag = false;
 };
 
 /**
