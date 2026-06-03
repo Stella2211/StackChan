@@ -47,6 +47,9 @@ bool BackendClient::isConnected() const
 void BackendClient::wireHandlers()
 {
     ws_->OnConnected([this]() {
+        if (!alive_.load()) {
+            return;
+        }
         mclog::tagInfo(_tag, "ws connected");
         connected_ = true;
         if (cb_.onConnected) {
@@ -55,6 +58,9 @@ void BackendClient::wireHandlers()
     });
 
     ws_->OnDisconnected([this]() {
+        if (!alive_.load()) {
+            return;
+        }
         mclog::tagWarn(_tag, "ws disconnected");
         connected_ = false;
         ready_     = false;
@@ -63,9 +69,17 @@ void BackendClient::wireHandlers()
         }
     });
 
-    ws_->OnError([this](int err) { mclog::tagError(_tag, "ws error: {}", err); });
+    ws_->OnError([this](int err) {
+        if (!alive_.load()) {
+            return;
+        }
+        mclog::tagError(_tag, "ws error: {}", err);
+    });
 
     ws_->OnData([this](const char* data, size_t len, bool binary) {
+        if (!alive_.load()) {
+            return;
+        }
         if (binary) {
             // Audio bytes of the currently open output.audio segment.
             if (cb_.onAudioChunk && len > 0) {
@@ -113,6 +127,10 @@ bool BackendClient::connect()
 void BackendClient::close()
 {
     ready_ = false;
+    // Stop dispatching into cb_ before tearing down ws_. ws_->Close() then joins the
+    // receive task, so by the time we reset() no handler is in flight. (Residual
+    // safety relies on Close() joining; this flag shrinks the window further.)
+    alive_ = false;
     if (ws_) {
         ws_->Close();
         ws_.reset();

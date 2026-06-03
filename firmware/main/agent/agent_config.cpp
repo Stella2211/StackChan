@@ -61,6 +61,14 @@ Config load_config()
 
     mclog::tagInfo(_tag, "loaded: host='{}' tls={} route={} token={}", cfg.host, cfg.tls, route_name(cfg.route),
                    cfg.token.empty() ? "(none)" : "(set)");
+    // A host without an explicit port makes the WebSocket fall back to the scheme
+    // default (ws=80 / wss=443), which won't match the backend (default 8787) and
+    // is easy to overlook. Warn so a missing ":port" doesn't look like a silent
+    // connect failure.
+    if (!cfg.host.empty() && cfg.host.find(':') == std::string::npos) {
+        mclog::tagWarn(_tag, "host '{}' has no port; WS will use {} (set 'ip:port', e.g. ...:8787)", cfg.host,
+                       cfg.tls ? "443" : "80");
+    }
     return cfg;
 }
 
