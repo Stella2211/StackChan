@@ -19,5 +19,15 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sdkconfig.defaults.local")
     message(STATUS "StackChan: detected sdkconfig.defaults.local, applying overlay")
 endif()
 
+# MicroLink (Tailscale client) lives outside components/ so its repo-root
+# CMakeLists isn't mistaken for an IDF component. Point at its components/ dir;
+# the nested wireguard_lwip component is auto-discovered (same as MicroLink's own
+# examples). Fetched by fetch_repos.py into firmware/microlink (git-ignored), so
+# the guard keeps the build working before the dependency is fetched.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/microlink/components")
+    list(APPEND EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/microlink/components")
+    message(STATUS "StackChan: MicroLink (Tailscale) component enabled")
+endif()
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(stack-chan)

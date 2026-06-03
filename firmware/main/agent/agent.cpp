@@ -7,6 +7,7 @@
 #include "agent_config.h"
 #include "backend_client.h"
 #include "audio_pipeline.h"
+#include "tailscale.h"
 
 #include <hal/hal.h>
 #include <hal/board/stackchan_display.h>
@@ -375,6 +376,12 @@ void start()
     // 5) Network (blocks until Wi-Fi is up; enters config mode if unprovisioned).
     faceSpeech("system", "ネットワーク接続中...");
     GetHAL().startNetwork([](std::string_view msg) { mclog::tagInfo(_tag, "net: {}", msg); });
+
+    // 5b) Tailscale (MicroLink) tunnel, if provisioned. No-op AND silent otherwise
+    //     (the status sink fires only on the enabled path). Makes a tailnet-only
+    //     backend reachable; the WebSocket transport is unchanged because lwIP
+    //     routes 100.64.0.0/10 through the WireGuard netif.
+    tailscale_bring_up(g_cfg, [](const char* msg) { faceSpeech("system", msg); });
 
     // 6) Audio I/O.
     if (!g_audio.init()) {

@@ -319,6 +319,7 @@ idf_component_register(SRCS ${SOURCES}
                         mooncake
                         mooncake_log
                         smooth_ui_toolkit
+                        microlink
                     )
 
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME
@@ -330,6 +331,23 @@ target_compile_definitions(${COMPONENT_LIB}
                     PRIVATE BOARD_TYPE=\"${BOARD_TYPE}\" BOARD_NAME=\"${BOARD_NAME}\"
                     PRIVATE BUILTIN_TEXT_FONT=${BUILTIN_TEXT_FONT} BUILTIN_ICON_FONT=${BUILTIN_ICON_FONT}
                     )
+
+# Optional build-time provisioning passthrough. Forwards selected -D cache vars
+# (when set on the idf.py command line) to the agent/tailscale sources as compile
+# definitions, so config can be baked in without NVS provisioning, e.g.:
+#   idf.py build -DAGENT_DEFAULT_HOST='"100.102.53.22:8787"' \
+#                -DTAILSCALE_DEFAULT_ENABLED=true \
+#                -DTAILSCALE_DEFAULT_AUTHKEY='"tskey-auth-..."'
+# Quote string values as '"..."' so the surrounding quotes survive into the macro.
+foreach(_def AGENT_DEFAULT_HOST AGENT_DEFAULT_TLS AGENT_DEFAULT_TOKEN AGENT_DEFAULT_ROUTE
+             TAILSCALE_DEFAULT_ENABLED TAILSCALE_DEFAULT_AUTHKEY TAILSCALE_DEFAULT_DEVNAME)
+    # Skip empty values: an empty -D expands to `FOO=`, and a string macro used as
+    # an initializer (e.g. cfg.token = AGENT_DEFAULT_TOKEN;) would then fail to
+    # compile instead of falling back to the source #ifndef default.
+    if(DEFINED ${_def} AND NOT "${${_def}}" STREQUAL "")
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE ${_def}=${${_def}})
+    endif()
+endforeach()
 
 # Add generation rules
 add_custom_command(

@@ -43,7 +43,9 @@ CONFIG_ESP_WIFI_IRAM_OPT=n
 CONFIG_ESP_WIFI_RX_IRAM_OPT=n
 CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
-CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16
+# Raised from the IDF default to give WireGuard's decrypted-frame path (posted to
+# the TCPIP thread via tcpip_input) more headroom; see the MicroLink block below.
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
@@ -78,3 +80,32 @@ CONFIG_LV_USE_SNAPSHOT=y
 CONFIG_LV_USE_IMGFONT=y
 CONFIG_LV_BUILD_EXAMPLES=n
 CONFIG_LV_BUILD_DEMOS=n
+
+# ===== MicroLink (Tailscale client) =====
+# Routes the custom AI agent's backend WebSocket through a WireGuard tunnel so a
+# tailnet-only backend (e.g. 100.x) is reachable. See main/agent/tailscale.cpp.
+# Required by MicroLink / wireguard_lwip; the CONFIG_ML_* keys are simply unknown
+# (ignored with a warning) until fetch_repos.py pulls the dependency.
+#
+# mbedTLS: Noise/WireGuard need ChaCha20-Poly1305 + HKDF; DERP & control plane
+# use TLS 1.2 with the bundled CA roots for cert validation.
+CONFIG_MBEDTLS_CHACHA20_C=y
+CONFIG_MBEDTLS_POLY1305_C=y
+CONFIG_MBEDTLS_CHACHAPOLY_C=y
+CONFIG_MBEDTLS_HKDF_C=y
+CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+# lwIP: WireGuard adds a netif + extra sockets and posts decrypted frames to the
+# TCPIP thread; give it more sockets and IPv4 reassembly. (LWIP_TCPIP_RECVMBOX_SIZE
+# is raised to 64 at its single definition higher up in this file.)
+CONFIG_LWIP_MAX_SOCKETS=16
+CONFIG_LWIP_SO_RCVBUF=y
+CONFIG_LWIP_IP4_REASSEMBLY=y
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+# MicroLink tuning: small peer table (we mainly talk to the backend) and no
+# built-in HTTP config server (we provision via NVS; saves ~28KB flash + ~7KB RAM
+# and avoids a second :80 server clashing with WifiManager's config portal).
+CONFIG_ML_MAX_PEERS=4
+CONFIG_ML_ENABLE_CONFIG_HTTPD=n
