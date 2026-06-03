@@ -32,7 +32,13 @@ CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
-CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+# The WiFi/IP event handlers (managed_components/78__esp-wifi-connect) run on this
+# task. HandleScanResult() + StartConnect() invoke the network-event callback, which
+# in the custom-agent path formats log lines via fmt twice (hal_network's fmt::format
+# -> agent onLog -> mclog::tagInfo). Two nested fmt passes (~500B inline buffer each)
+# on top of the scan-result handling overflow the 4096B default -> "stack overflow in
+# task sys_evt" when opening the AI Agent. 8192 gives comfortable headroom.
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=8192
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=3
@@ -51,7 +57,14 @@ CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
 CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
 CONFIG_MBEDTLS_SSL_RENEGOTIATION=n
-CONFIG_LIBC_NEWLIB_NANO_FORMAT=y
+# Use the FULL newlib printf/scanf formatter, not "nano". The nano formatter does
+# not understand the 'll' (64-bit) length modifier: 64-bit specifiers misprint as
+# literal "ld"/"lu", and -- worse -- a "%s" that follows a "%llu" in the same format
+# string reads a corrupted vararg pointer and crashes (LoadProhibited). MicroLink's
+# logging uses %llu/%lld in many places (e.g. ml_wg_mgr.c process_disco_pong's
+# "DISCO PONG from %s: RTT=%llu ms (via %s)"), so nano format faults during the
+# Tailscale DISCO exchange. Full format costs ~tens of KB of flash but is correct.
+CONFIG_LIBC_NEWLIB_NANO_FORMAT=n
 CONFIG_CAMERA_GC0308=y
 CONFIG_CAMERA_GC0308_DVP_YUV422_320X240_20FPS=y
 CONFIG_LV_USE_CLIB_MALLOC=y

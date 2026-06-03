@@ -33,6 +33,7 @@
     {
         "url": "https://github.com/CamM2325/microlink.git",
         "path": "microlink",
-        "branch": "216da3300f0493b0860247d43f7af5ce29df63a5"
+        "branch": "216da3300f0493b0860247d43f7af5ce29df63a5",
+        "patch": "patches/microlink.patch"
     }
 ]

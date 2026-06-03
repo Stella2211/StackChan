@@ -1,0 +1,51 @@
+diff --git a/components/microlink/components/wireguard_lwip/src/wireguardif.c b/components/microlink/components/wireguard_lwip/src/wireguardif.c
+index 6627fd0..983c783 100644
+--- a/components/microlink/components/wireguard_lwip/src/wireguardif.c
++++ b/components/microlink/components/wireguard_lwip/src/wireguardif.c
+@@ -537,10 +537,21 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
+ 
+ 								// 5. If the plaintext packet has not been dropped, it is inserted into the receive queue of the wg0 interface.
+ 								if (dest_ok) {
+-									// Send packet to be processed by LWIP
++									// Hand the decrypted packet UP via the netif's configured input
++									// function, NOT ip_input() directly. wireguardif_network_rx runs
++									// on the caller's thread (microlink's wg_mgr task); without
++									// LWIP_TCPIP_CORE_LOCKING, running lwIP core (ip_input/tcp_input)
++									// off the TCPIP thread races the socket layer and corrupts TCP PCB
++									// state -> crash in lwip_netconn_do_writemore. microlink sets
++									// netif->input = tcpip_input precisely so RX is posted to the
++									// TCPIP thread; honor that hook here.
+ 									WG_DEBUG("[WG_RX_IP] Passing %u bytes to IP layer\n", (unsigned)pbuf->tot_len);
+-									ip_input(pbuf, device->netif);
+-									// pbuf is owned by IP layer now
++									if (device->netif->input(pbuf, device->netif) != ERR_OK) {
++										// tcpip_input does not free the pbuf if its mailbox is full;
++										// drop it ourselves to avoid a leak.
++										pbuf_free(pbuf);
++									}
++									// pbuf is owned by the IP layer (or freed above) now
+ 									pbuf = NULL;
+ 								} else {
+ 									WG_DEBUG("[WG_RX_IP] DROPPED: dest_ok=false\n");
+diff --git a/components/microlink/src/ml_derp.c b/components/microlink/src/ml_derp.c
+index c57fd0f..6748df6 100644
+--- a/components/microlink/src/ml_derp.c
++++ b/components/microlink/src/ml_derp.c
+@@ -626,8 +626,15 @@ void ml_derp_tx_task(void *arg) {
+             }
+         }
+ 
+-        /* Yield briefly */
+-        vTaskDelay(pdMS_TO_TICKS(1));
++        /* Yield between poll cycles. The DERP socket is O_NONBLOCK (see ml_derp_connect),
++         * so SO_RCVTIMEO does NOT actually block reads: poll_derp_read returns immediately
++         * when idle. With CONFIG_FREERTOS_HZ=100, pdMS_TO_TICKS(1) rounds to 0 ticks, so the
++         * old 1ms "yield" was no delay at all -- this task busy-spun at ~8500 loops/s,
++         * starving CPU0's idle task (task_wdt fires) and flooding the lwIP tcpip thread with
++         * a setsockopt() per spin (ml_derp_bio_recv_timeout), which stalled the agent's
++         * backend TCP connect. 10ms = 1 tick guarantees a real yield (~100 polls/s, still
++         * far more responsive than the intended 100ms rhythm). */
++        vTaskDelay(pdMS_TO_TICKS(10));
+     }
+ 
+     ESP_LOGI(TAG, "DERP I/O task exiting");

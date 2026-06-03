@@ -116,14 +116,64 @@ public:
 
     bool IsExternalPowerConnected()
     {
-        const uint8_t power_status      = ReadReg(0x01);
-        const uint8_t current_direction = (power_status & 0b01100000) >> 5;
-        const bool is_charging_done     = (power_status & 0b00000111) == 0b00000100;
+        RefreshStatusReg();
+        const uint8_t current_direction = (last_status_reg_ & 0b01100000) >> 5;
+        const bool is_charging_done     = (last_status_reg_ & 0b00000111) == 0b00000100;
 
         // Treat any non-discharging state as externally powered so a plugged-in cable
         // still counts even after the battery is full.
         return current_direction != 2 || is_charging_done;
     }
+
+    // ---- Non-fatal battery / power-status reads --------------------------------
+    // The status bar (~1 Hz) and the power-save poller (every 20 ms on the touchpad
+    // timer task) read the AXP2101 while the rest of the system runs. Under heavy
+    // I2C/CPU contention -- most visibly during the MicroLink/Tailscale bring-up --
+    // a transfer can momentarily return ESP_ERR_TIMEOUT. The upstream Axp2101 readers
+    // (IsCharging/IsDischarging/GetBatteryLevel) funnel that through
+    // I2cDevice::ReadReg -> ESP_ERROR_CHECK -> abort(), which crashed the device
+    // mid-session. These helpers mirror the FT6336 touch poll: read via the non-fatal
+    // TryReadRegs() and, on a transient failure, reuse the last good value.
+
+    // Battery percentage + charge direction in one shot. A failed transfer leaves the
+    // corresponding cached field unchanged.
+    void ReadBatteryState(int& level, bool& charging, bool& discharging)
+    {
+        RefreshStatusReg();
+        const uint8_t dir = (last_status_reg_ & 0b01100000) >> 5;
+        charging          = (dir == 1);
+        discharging       = (dir == 2);
+
+        uint8_t pct = 0;
+        if (TryReadRegs(0xA4, &pct, 1) == ESP_OK) {
+            last_level_ = pct;
+        }
+        level = last_level_;
+    }
+
+    // Non-fatal replacement for Axp2101::IsDischarging().
+    bool SafeIsDischarging()
+    {
+        RefreshStatusReg();
+        return ((last_status_reg_ & 0b01100000) >> 5) == 2;
+    }
+
+private:
+    // Refresh the cached power-status register (0x01). On a transient I2C timeout the
+    // cache is left untouched so callers keep seeing the last good state.
+    void RefreshStatusReg()
+    {
+        uint8_t status = 0;
+        if (TryReadRegs(0x01, &status, 1) == ESP_OK) {
+            last_status_reg_ = status;
+        }
+    }
+
+    // Last good AXP2101 readings. Defaults read as "externally powered, not
+    // discharging, full" so a (practically impossible) failed first read -- init runs
+    // unloaded -- can't spuriously trip power-save/shutdown.
+    uint8_t last_status_reg_ = 0x00;
+    int     last_level_      = 100;
 };
 
 class CustomBacklight : public Backlight {
@@ -276,7 +326,7 @@ private:
         }
         last_power_state_check_ms_ = now_ms;
 
-        UpdatePowerSaveEnabled(pmic_->IsExternalPowerConnected(), pmic_->IsDischarging());
+        UpdatePowerSaveEnabled(pmic_->IsExternalPowerConnected(), pmic_->SafeIsDischarging());
     }
 
     void InitializePowerSaveTimer()
@@ -303,7 +353,7 @@ private:
             GetBacklight()->RestoreBrightness();
         });
         power_save_timer_->OnShutdownRequest([this]() { pmic_->PowerOff(); });
-        UpdatePowerSaveEnabled(pmic_->IsExternalPowerConnected(), pmic_->IsDischarging());
+        UpdatePowerSaveEnabled(pmic_->IsExternalPowerConnected(), pmic_->SafeIsDischarging());
     }
 
     void InitializeI2c()
@@ -527,14 +577,13 @@ public:
     virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override
     {
         static bool last_discharging = false;
-        charging                     = pmic_->IsCharging();
-        discharging                  = pmic_->IsDischarging();
+        // Non-fatal: a transient AXP2101 I2C timeout reuses the last good reading
+        // instead of aborting (see Pmic::ReadBatteryState).
+        pmic_->ReadBatteryState(level, charging, discharging);
         if (discharging != last_discharging) {
             power_save_timer_->SetEnabled(discharging);
             last_discharging = discharging;
         }
-
-        level = pmic_->GetBatteryLevel();
         return true;
     }
 
