@@ -394,6 +394,12 @@ void StackChanCamera::SetExplainUrl(const std::string& url, const std::string& t
 
 bool StackChanCamera::Capture()
 {
+    // Default path (xiaozhi runtime): play the shutter sfx. See Capture(bool).
+    return Capture(true);
+}
+
+bool StackChanCamera::Capture(bool play_shutter)
+{
     if (encoder_thread_.joinable()) {
         encoder_thread_.join();
     }
@@ -402,8 +408,11 @@ bool StackChanCamera::Capture()
         return false;
     }
 
-    // Play shutter sfx
-    hal_bridge::app_play_sound(OGG_CAMERA_SHUTTER);
+    // Play shutter sfx. Routed through the xiaozhi AudioService, which is not
+    // initialised in the custom-agent runtime; callers there pass play_shutter=false.
+    if (play_shutter) {
+        hal_bridge::app_play_sound(OGG_CAMERA_SHUTTER);
+    }
 
     for (int i = 0; i < 3; i++) {
         struct v4l2_buffer buf = {};

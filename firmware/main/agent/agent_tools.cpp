@@ -192,7 +192,11 @@ void do_capture_image(const ActionSink& sink, const std::string& actionId)
         return;
     }
 
-    if (!cam->Capture()) {
+    // play_shutter=false: the shutter sfx routes through the xiaozhi AudioService,
+    // which the custom agent never initialises (it has its own audio path). Playing
+    // it here previously crashed in AudioService::PlaySound (null codec). The agent
+    // also wouldn't want the shutter mixing into the TTS I2S stream anyway.
+    if (!cam->Capture(false)) {
         mclog::tagError(_tag, "capture_image: capture failed");
         if (sink.result) {
             sink.result(actionId, false, "capture failed");

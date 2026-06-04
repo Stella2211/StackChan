@@ -50,6 +50,15 @@ public:
 
     virtual void SetExplainUrl(const std::string& url, const std::string& token);
     virtual bool Capture() override;
+    /**
+     * @brief Capture one frame, optionally playing the shutter sfx.
+     *
+     * The shutter is played through the xiaozhi AudioService, which only exists in
+     * the xiaozhi runtime. The custom agent runs its own audio path and leaves that
+     * service uninitialised, so it must capture with play_shutter=false to avoid a
+     * null dereference inside AudioService::PlaySound.
+     */
+    bool Capture(bool play_shutter);
     bool StreamCaptures();
 
     // 翻转控制函数
