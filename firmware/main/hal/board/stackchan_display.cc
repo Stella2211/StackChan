@@ -14,6 +14,9 @@
 #include <settings.h>
 #include <lvgl.h>
 #include <lvgl_theme.h>
+#include <display/lvgl_display/lvgl_font.h>
+#include <assets.h>
+#include <cJSON.h>
 #include <stackchan/stackchan.h>
 #include <assets/lang_config.h>
 #include <hal/hal.h>
@@ -456,6 +459,57 @@ void StackChanAvatarDisplay::SetTheme(Theme* theme)
     auto text_font  = lvgl_theme->text_font()->font();
 
     stackchan.avatar().setSpeechTextFont((void*)text_font);
+}
+
+void StackChanAvatarDisplay::ApplyAssetsTextFont()
+{
+    // The xiaozhi path swaps in the full CJK text font via Application::Start() ->
+    // Assets::Apply(). The custom agent replaces xiaozhi and never runs that, so the
+    // speech bubble keeps the compiled BUILTIN_TEXT_FONT (font_puhui_basic_*), whose
+    // "basic" subset lacks most Japanese kana/kanji. Load just the cbin text font that
+    // the assets build already embedded (index.json "text_font", e.g.
+    // font_puhui_common_20_4.bin) and override the registered themes. We deliberately
+    // avoid Assets::Apply() here: it also runs LoadSrmodelsFromIndex(), which pulls in
+    // the xiaozhi Application singleton the agent is meant to bypass.
+    auto& assets = Assets::GetInstance();
+
+    void* ptr   = nullptr;
+    size_t size = 0;
+    if (!assets.GetAssetData("index.json", ptr, size)) {
+        ESP_LOGW(TAG, "assets index.json not found; keeping builtin text font");
+        return;
+    }
+
+    cJSON* root = cJSON_ParseWithLength(static_cast<char*>(ptr), size);
+    if (root == nullptr) {
+        ESP_LOGW(TAG, "assets index.json is not valid JSON; keeping builtin text font");
+        return;
+    }
+
+    cJSON* font = cJSON_GetObjectItem(root, "text_font");
+    if (cJSON_IsString(font) && assets.GetAssetData(font->valuestring, ptr, size)) {
+        auto text_font = std::make_shared<LvglCBinFont>(ptr);
+        if (text_font->font() != nullptr) {
+            auto& theme_manager = LvglThemeManager::GetInstance();
+            for (const char* name : {"light", "dark"}) {
+                if (auto* theme = theme_manager.GetTheme(name)) {
+                    theme->set_text_font(text_font);
+                }
+            }
+            ESP_LOGI(TAG, "Applied assets text font: %s", font->valuestring);
+
+            // Re-apply the active theme so the speech bubble adopts the new font now.
+            if (current_theme_ != nullptr) {
+                SetTheme(current_theme_);
+            }
+        } else {
+            ESP_LOGW(TAG, "Failed to load cbin text font %s", font->valuestring);
+        }
+    } else {
+        ESP_LOGW(TAG, "assets index.json has no usable text_font entry");
+    }
+
+    cJSON_Delete(root);
 }
 
 #include <hal/board/hal_bridge.h>

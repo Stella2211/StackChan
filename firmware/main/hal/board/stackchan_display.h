@@ -38,6 +38,12 @@ public:
 
     void InitializeLcdThemes();
 
+    // Load the cbin text font embedded in the assets partition (index.json "text_font")
+    // and override the registered themes / speech bubble with it. The xiaozhi path does
+    // this via Assets::Apply(); the custom agent bypasses xiaozhi and calls this directly
+    // so the speech bubble can render Japanese (the compiled BUILTIN "basic" font cannot).
+    void ApplyAssetsTextFont();
+
     // Override Display methods to control Robot
     virtual void SetEmotion(const char* emotion) override;
     virtual void SetChatMessage(const char* role, const char* content) override;

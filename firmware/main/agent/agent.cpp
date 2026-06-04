@@ -529,6 +529,12 @@ void start()
         GetHAL().bootLogo.reset();
     }
 
+    // 2b) Swap the speech-bubble font to the full-CJK cbin font embedded in the assets
+    //     partition. The xiaozhi path does this via Assets::Apply(); we bypass xiaozhi,
+    //     so without this the bubble keeps the compiled "basic" font and can't render
+    //     most Japanese kana/kanji. Called outside the lock above (SetTheme locks itself).
+    face()->ApplyAssetsTextFont();
+
     // 3) Per-frame avatar update task (blink/breath/head-pet/speaking/idle).
     xTaskCreatePinnedToCore(update_task, "agent_face", 4096, nullptr, 3, nullptr, 1);
 
