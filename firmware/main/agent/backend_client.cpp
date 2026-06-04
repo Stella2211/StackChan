@@ -186,6 +186,20 @@ void BackendClient::handleText(const char* data, size_t len)
         if (cb_.onToolCall) {
             cb_.onToolCall(name ? name : "", status ? status : "", summary ? summary : "");
         }
+    } else if (std::strcmp(type, "action.start") == 0) {
+        // Built-in device tool execution request. Hand id/name/args to the agent,
+        // which queues it to a worker task (camera/JPEG must not run on this task).
+        const char* id   = doc["id"].as<const char*>();
+        const char* name = doc["name"].as<const char*>();
+        std::string args;
+        if (doc["args"].isNull()) {
+            args = "{}";
+        } else {
+            ArduinoJson::serializeJson(doc["args"], args);
+        }
+        if (cb_.onAction) {
+            cb_.onAction(id ? id : "", name ? name : "", args);
+        }
     } else if (std::strcmp(type, "error") == 0) {
         const char* msg = doc["message"].as<const char*>();
         bool fatal      = doc["fatal"].as<bool>();
@@ -223,6 +237,61 @@ bool BackendClient::sendInputAudioEnd()
     }
     static const std::string msg = R"({"type":"input.audio.end"})";
     return ws_->Send(msg);
+}
+
+/* ------------------------- device tool results / images ------------------------- */
+
+bool BackendClient::sendActionResult(const std::string& id, bool ok, const std::string& summary)
+{
+    if (!isConnected()) {
+        return false;
+    }
+    ArduinoJson::JsonDocument doc;
+    doc["type"] = "action.result";
+    doc["id"]   = id;
+    doc["ok"]   = ok;
+    if (!summary.empty()) {
+        doc["summary"] = summary;
+    }
+    std::string out;
+    ArduinoJson::serializeJson(doc, out);
+    return ws_->Send(out);
+}
+
+bool BackendClient::sendImageStart(const std::string& id, const std::string& actionId, const std::string& format)
+{
+    if (!isConnected()) {
+        return false;
+    }
+    ArduinoJson::JsonDocument doc;
+    doc["type"]     = "input.image.start";
+    doc["id"]       = id;
+    doc["actionId"] = actionId;
+    doc["format"]   = format;
+    std::string out;
+    ArduinoJson::serializeJson(doc, out);
+    return ws_->Send(out);
+}
+
+bool BackendClient::sendImageChunk(const uint8_t* data, size_t len)
+{
+    if (!isConnected() || data == nullptr || len == 0) {
+        return false;
+    }
+    return ws_->Send(reinterpret_cast<const void*>(data), len, /*binary=*/true);
+}
+
+bool BackendClient::sendImageEnd(const std::string& id)
+{
+    if (!isConnected()) {
+        return false;
+    }
+    ArduinoJson::JsonDocument doc;
+    doc["type"] = "input.image.end";
+    doc["id"]   = id;
+    std::string out;
+    ArduinoJson::serializeJson(doc, out);
+    return ws_->Send(out);
 }
 
 }  // namespace custom_agent

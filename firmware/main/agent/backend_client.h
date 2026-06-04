@@ -42,6 +42,13 @@ struct BackendCallbacks {
     std::function<void(const std::string& message, bool fatal)> onError;  // "error"
     std::function<void(const std::string& name, const std::string& status, const std::string& summary)>
         onToolCall;  // "tool.call" (display only)
+    // "action.start": a built-in device tool the LLM asked us to run (move_head /
+    // play_gesture / set_expression / capture_image). `args` is the JSON object of
+    // the tool arguments, serialized to a string (or "{}" when absent). Keep the
+    // handler light: it fires from the WS receive task, so it must NOT execute the
+    // tool inline (camera capture/JPEG encode would block the socket) -- enqueue it
+    // to a worker instead. See agent.cpp / agent_tools.cpp.
+    std::function<void(const std::string& id, const std::string& name, const std::string& args)> onAction;
 };
 
 /**
@@ -75,6 +82,17 @@ public:
     bool sendAudioChunk(const int16_t* pcm16k, size_t samples);
     /// Terminate the utterance; the server starts generating the response.
     bool sendInputAudioEnd();
+
+    /* ------------------------- device tool results / images ------------------------- */
+    /// Acknowledge a device tool (`action.start`). `summary` is optional (display/log).
+    bool sendActionResult(const std::string& id, bool ok, const std::string& summary = "");
+    /// Begin a camera image stream. `actionId` echoes the `capture_image` action id.
+    bool sendImageStart(const std::string& id, const std::string& actionId,
+                        const std::string& format = "image/jpeg");
+    /// Send one chunk of the JPEG payload (binary frame).
+    bool sendImageChunk(const uint8_t* data, size_t len);
+    /// Terminate the image stream.
+    bool sendImageEnd(const std::string& id);
 
 private:
     void wireHandlers();

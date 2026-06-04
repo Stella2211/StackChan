@@ -6,6 +6,7 @@
 #include "agent.h"
 #include "agent_config.h"
 #include "backend_client.h"
+#include "agent_tools.h"
 #include "audio_pipeline.h"
 #include "tailscale.h"
 
@@ -19,10 +20,12 @@
 #include <mooncake_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/queue.h>
 
 #include <atomic>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <vector>
 #include <cstdlib>
 #include <cstring>
@@ -51,6 +54,20 @@ std::atomic<State> g_state{State::Idle};
 std::atomic<bool> g_turnComplete{false};
 std::atomic<bool> g_speakingShown{false};
 std::atomic<bool> g_needHeaderStrip{false};
+
+// g_client is created/reset on the capture-loop task but is also touched by the
+// action worker task (to send results / image frames). This mutex guards those
+// cross-task accesses so a reconnect can't free the client out from under a send.
+std::mutex g_clientMutex;
+
+// One pending device tool ("action.start"). Queued as a heap pointer because a
+// FreeRTOS queue byte-copies its items and std::string isn't trivially copyable.
+struct ActionItem {
+    std::string id;
+    std::string name;
+    std::string args;
+};
+QueueHandle_t g_actionQueue = nullptr;
 
 }  // namespace
 
@@ -137,6 +154,75 @@ static size_t wav_data_offset(const uint8_t* data, size_t len)
 }
 
 /* -------------------------------------------------------------------------- */
+/*                         Device tool worker (action.*)                       */
+/* -------------------------------------------------------------------------- */
+
+// Send wrappers used by the worker. Each grabs g_clientMutex so it never races a
+// reconnect: if the client was just torn down it returns false instead of touching
+// freed memory. The heavy work (camera grab / JPEG encode) happens in the tool
+// before any of these are called, so the lock is only ever held briefly.
+static bool client_send_action_result(const std::string& id, bool ok, const std::string& summary)
+{
+    std::lock_guard<std::mutex> lk(g_clientMutex);
+    return g_client ? g_client->sendActionResult(id, ok, summary) : false;
+}
+static bool client_send_image_start(const std::string& id, const std::string& actionId, const std::string& fmt)
+{
+    std::lock_guard<std::mutex> lk(g_clientMutex);
+    return g_client ? g_client->sendImageStart(id, actionId, fmt) : false;
+}
+static bool client_send_image_chunk(const uint8_t* data, size_t len)
+{
+    std::lock_guard<std::mutex> lk(g_clientMutex);
+    return g_client ? g_client->sendImageChunk(data, len) : false;
+}
+static bool client_send_image_end(const std::string& id)
+{
+    std::lock_guard<std::mutex> lk(g_clientMutex);
+    return g_client ? g_client->sendImageEnd(id) : false;
+}
+
+// Drains pending actions (e.g. on disconnect) so a reconnect doesn't replay tools
+// the previous session asked for.
+static void drain_action_queue()
+{
+    if (g_actionQueue == nullptr) {
+        return;
+    }
+    ActionItem* item = nullptr;
+    while (xQueueReceive(g_actionQueue, &item, 0) == pdTRUE) {
+        delete item;
+    }
+}
+
+// Runs built-in device tools off the WS receive task. Serialized (one tool at a
+// time), at a lower priority than audio, so a camera capture/encode or a gesture's
+// inter-keyframe sleeps never stall the socket or the voice path.
+//
+// Half-duplex note: capture_image streams image binary frames from THIS task while
+// the capture loop sends mic-audio binary frames from its own. The server tells the
+// two apart by framing (input.image.start..end => image, else audio), so they must
+// not interleave. They don't today: capture_image only runs in the Responding state,
+// during which the capture loop is half-duplex and sends no audio. If that half-
+// duplex assumption ever changes, image and audio sends must be mutually excluded.
+static void action_worker_task(void*)
+{
+    ActionSink sink;
+    sink.result     = [](const std::string& id, bool ok, const std::string& s) { client_send_action_result(id, ok, s); };
+    sink.imageStart  = [](const std::string& id, const std::string& a, const std::string& f) { client_send_image_start(id, a, f); };
+    sink.imageChunk  = [](const uint8_t* d, size_t n) { client_send_image_chunk(d, n); };
+    sink.imageEnd    = [](const std::string& id) { client_send_image_end(id); };
+
+    while (1) {
+        ActionItem* item = nullptr;
+        if (xQueueReceive(g_actionQueue, &item, portMAX_DELAY) == pdTRUE && item != nullptr) {
+            execute_action(sink, item->id, item->name, item->args);
+            delete item;
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
 /*                           Backend event callbacks                          */
 /* -------------------------------------------------------------------------- */
 
@@ -156,6 +242,7 @@ static void wire_callbacks()
 
     cb.onDisconnected = []() {
         g_audio.flushPlayback();
+        drain_action_queue();
         g_state         = State::Idle;
         g_turnComplete  = false;
         g_speakingShown = false;
@@ -197,6 +284,24 @@ static void wire_callbacks()
         }
     };
 
+    // A built-in device tool the LLM invoked. Hand it to the worker task; never run
+    // it here (this fires from the WS receive task, which must keep draining the
+    // socket -- a camera capture would block it).
+    cb.onAction = [](const std::string& id, const std::string& name, const std::string& args) {
+        if (g_actionQueue == nullptr) {
+            return;
+        }
+        auto* item = new ActionItem{id, name, args};
+        if (xQueueSend(g_actionQueue, &item, 0) != pdTRUE) {
+            mclog::tagWarn(_tag, "action queue full, dropping '{}'", name);
+            delete item;
+            // Fail the action fast so a dropped capture_image doesn't make the server
+            // wait out its image timeout (~10s). Cheap to send from here: it's a tiny
+            // frame and the WS send path is independent of this receive callback.
+            client_send_action_result(id, false, "busy");
+        }
+    };
+
     cb.onError = [](const std::string& message, bool /*fatal*/) {
         // For fatal errors the server closes the connection itself; onDisconnected
         // then drives reconnect from the capture loop. Avoid tearing down the
@@ -215,7 +320,11 @@ static bool connect_with_retry()
 {
     for (int attempt = 1;; ++attempt) {
         faceSpeech("system", "サーバーに接続中...");
-        g_client = std::make_unique<BackendClient>(g_cfg);
+        {
+            // Guarded so the action worker never sends through a half-swapped client.
+            std::lock_guard<std::mutex> lk(g_clientMutex);
+            g_client = std::make_unique<BackendClient>(g_cfg);
+        }
         wire_callbacks();
 
         if (g_client->connect()) {
@@ -233,7 +342,10 @@ static bool connect_with_retry()
 
         mclog::tagWarn(_tag, "connect attempt {} failed, retrying", attempt);
         faceSpeech("system", "接続失敗。再試行します");
-        g_client.reset();
+        {
+            std::lock_guard<std::mutex> lk(g_clientMutex);
+            g_client.reset();
+        }
         GetHAL().delay(3000);
     }
 }
@@ -419,6 +531,15 @@ void start()
 
     // 3) Per-frame avatar update task (blink/breath/head-pet/speaking/idle).
     xTaskCreatePinnedToCore(update_task, "agent_face", 4096, nullptr, 3, nullptr, 1);
+
+    // 3b) Device-tool worker (move_head / play_gesture / set_expression /
+    //     capture_image). Lower priority than the face task; unpinned so the
+    //     ~hundreds-of-ms JPEG encode can land on whichever core is free. The
+    //     software JPEG encoder runs on THIS task's stack (image_to_jpeg with
+    //     task_enable=false), on top of ArduinoJson + libc, so the stack is sized
+    //     generously (12 KB) to leave headroom.
+    g_actionQueue = xQueueCreate(8, sizeof(ActionItem*));
+    xTaskCreatePinnedToCore(action_worker_task, "agent_action", 12288, nullptr, 2, nullptr, tskNO_AFFINITY);
 
     // 4) Idle face while we connect.
     faceStatus(Lang::Strings::STANDBY);
