@@ -17,9 +17,12 @@ namespace custom_agent {
 /**
  * @brief Microphone capture + speaker playback for the custom agent.
  *
- * Capture: reads raw frames from the duplex codec (24kHz, 2ch interleaved
- *          [mic, aec-ref]), extracts the mic channel and resamples to 16kHz mono
- *          (the format the backend expects for input).
+ * Capture: reads raw frames from the duplex codec (24kHz, interleaved -- 2ch
+ *          [mic, AEC-ref] on CoreS3) and resamples to 16kHz while keeping every
+ *          channel. The interleaved 16kHz frame is fed to the ESP-SR AFE
+ *          (wake-word or voice-processing), which owns mic extraction / NS / VAD
+ *          and emits the processed mono the backend expects. The reference channel
+ *          is preserved so device AEC can be enabled later.
  *
  * Playback: a background task drains a queue of 24kHz mono PCM buffers straight
  *           to the codec (the backend already outputs 24kHz, matching the codec
@@ -30,16 +33,21 @@ namespace custom_agent {
  */
 class AudioPipeline {
 public:
-    static constexpr int kOutRate    = 16000;  // backend input rate
+    static constexpr int kOutRate    = 16000;  // backend / AFE input rate
     static constexpr int kFrameMs    = 20;     // capture frame size
-    static constexpr int kOutSamples = kOutRate * kFrameMs / 1000;  // 320
+    static constexpr int kOutSamples = kOutRate * kFrameMs / 1000;  // 320 (per channel)
 
     bool init();
     void deinit();
 
-    /// Read one ~20ms frame, mic-only, resampled to 16kHz mono.
-    /// `out` is resized to ~kOutSamples. Returns false on read failure.
-    bool captureFrame16k(std::vector<int16_t>& out);
+    /// Read one ~20ms codec frame, all input channels interleaved, resampled to
+    /// 16kHz. On CoreS3 that is 2ch [mic, AEC-ref]; channels are preserved so the
+    /// AFE keeps its reference input. `out` is resized to ~kOutSamples * channels.
+    /// Returns false on read failure.
+    bool captureFrame2ch16k(std::vector<int16_t>& out);
+
+    /// Number of interleaved input channels the codec provides (1 or 2).
+    int inputChannels() const { return inChannels_; }
 
     /// Queue one chunk of 24kHz mono s16le PCM for playback (bytes are copied).
     void enqueuePcm(const uint8_t* bytes, size_t len);
@@ -58,13 +66,14 @@ private:
     int inRate_        = 24000;
     int inChannels_    = 2;
 
-    // Linear resampler state (24k -> 16k), carried across frames.
-    float resamplePos_  = 0.0f;
-    int16_t prevSample_ = 0;
+    // Linear resampler state (24k -> 16k), carried across frames. The phase is
+    // shared by every channel (so they stay sample-aligned); the last sample of
+    // each channel is kept for interpolation across the block boundary.
+    float resamplePos_ = 0.0f;
+    std::vector<int16_t> prevSamples_;  // one per input channel
 
-    // Scratch buffers reused across capture calls.
+    // Scratch buffer reused across capture calls (interleaved codec read).
     std::vector<int16_t> readBuf_;
-    std::vector<int16_t> micBuf_;
 
     // Playback
     QueueHandle_t playQueue_   = nullptr;

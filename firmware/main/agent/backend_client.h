@@ -49,6 +49,13 @@ struct BackendCallbacks {
     // tool inline (camera capture/JPEG encode would block the socket) -- enqueue it
     // to a worker instead. See agent.cpp / agent_tools.cpp.
     std::function<void(const std::string& id, const std::string& name, const std::string& args)> onAction;
+    // "session.started": the server confirmed a logical session (and assigned its id
+    // if we omitted one). Display/log only -- keeping the id is optional.
+    std::function<void(const std::string& sessionId)> onSessionStarted;
+    // "session.closed": the server ended the session. `reason` is one of
+    // tool / client / idle / restart (treat as an opaque string). The device should
+    // return to the sleeping (wake-word) state.
+    std::function<void(const std::string& sessionId, const std::string& reason)> onSessionClosed;
 };
 
 /**
@@ -76,6 +83,13 @@ public:
     void close();
 
     /* ----------------------------- client -> server ----------------------------- */
+    /// Begin a logical (multi-turn) session, sent on tap / wake word before the first
+    /// utterance. An empty `sessionId` lets the server assign one (returned via
+    /// `session.started`).
+    bool sendSessionStart(const std::string& sessionId = "");
+    /// Request session end (e.g. the device's "1 minute of silence after playback"
+    /// timer). The server replies with `session.closed { reason: "client" }`.
+    bool sendSessionEnd();
     /// Declare the start of an utterance (pcm_s16le / 16000 / mono).
     bool sendInputAudioStart();
     /// Send one chunk of raw 16k mono PCM (binary frame).

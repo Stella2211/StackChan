@@ -10,9 +10,18 @@
 #include "audio_pipeline.h"
 #include "tailscale.h"
 
+// xiaozhi-esp32 ESP-SR AFE engines (wake word + voice processing) reused as-is.
+#include <wake_words/afe_wake_word.h>
+#include <processors/afe_audio_processor.h>
+#include <assets.h>
+#include <audio_codec.h>
+#include <model_path.h>
+#include <ArduinoJson.hpp>
+
 #include <hal/hal.h>
 #include <hal/board/stackchan_display.h>
 #include <stackchan/stackchan.h>
+#include <stackchan/avatar/avatar.h>  // DefaultAvatar::getPanel() for tap-to-start
 #include <board.h>
 #include <assets/lang_config.h>
 #include <apps/common/common.h>
@@ -38,10 +47,16 @@ static constexpr const char* _tag = "agent";
 /*                                   State                                     */
 /* -------------------------------------------------------------------------- */
 
+// Session state machine (multi-turn). Sleeping is the only state in which nothing
+// is sent to the backend; a tap / wake word opens a session and the device then
+// loops Listening -> Capturing -> Responding -> Listening for as many turns as the
+// user wants, until a 1-minute silence, an LLM end_session, or a server idle/restart
+// closes it and we fall back to Sleeping.
 enum class State {
-    Idle,        // listening for speech onset
-    Capturing,   // streaming the user's utterance
-    Responding,  // waiting for / playing the server response
+    Sleeping,    // wake-word listening; no session, nothing sent
+    Listening,   // session open, waiting for the user's next utterance (VAD onset)
+    Capturing,   // streaming the user's utterance (VAD says speaking)
+    Responding,  // waiting for / playing the server response (mic ignored, half-duplex)
 };
 
 namespace {
@@ -50,10 +65,27 @@ Config g_cfg;
 std::unique_ptr<BackendClient> g_client;
 AudioPipeline g_audio;
 
-std::atomic<State> g_state{State::Idle};
+// ESP-SR AFE engines. Both are created once and kept alive; only one is "running"
+// at a time (Start/Stop toggle, gated by state) so the CPU cost is one instance --
+// the extra cost is PSRAM for the second instance. `g_models` is the model list we
+// load from the assets partition and inject into both (see load_sr_models()).
+srmodel_list_t* g_models = nullptr;
+std::unique_ptr<AfeWakeWord> g_wake;        // sleeping: wake-word detection
+std::unique_ptr<AfeAudioProcessor> g_vc;    // session:  NS + VAD + mono extraction
+
+std::atomic<State> g_state{State::Sleeping};
+std::atomic<bool> g_sessionActive{false};   // true between session.start and session end
+std::atomic<bool> g_startRequested{false};  // tap / wake / head-pet entry (honored when sleeping)
+std::atomic<bool> g_closeRequested{false};  // server sent session.closed; loop returns to sleep
 std::atomic<bool> g_turnComplete{false};
 std::atomic<bool> g_speakingShown{false};
 std::atomic<bool> g_needHeaderStrip{false};
+
+// End the session after this much continuous post-playback silence (fixed, per spec).
+constexpr int kSessionIdleMs = 60'000;
+// AFE-VC OnOutput chunk size (OPUS_FRAME_DURATION_MS-equivalent). We do NOT Opus-encode;
+// this just sets how much processed mono 16k PCM is handed to us per callback.
+constexpr int kVcFrameMs = 60;
 
 // g_client is created/reset on the capture-loop task but is also touched by the
 // action worker task (to send results / image frames). This mutex guards those
@@ -223,6 +255,156 @@ static void action_worker_task(void*)
 }
 
 /* -------------------------------------------------------------------------- */
+/*                        SR models + AFE + session control                    */
+/* -------------------------------------------------------------------------- */
+
+// Load the ESP-SR model list (WakeNet / NS / VAD) from the 'assets' partition.
+//
+// This build embeds the models in 'assets' (there is no 'model' partition, so
+// esp_srmodel_init("model") would fail), and the custom-agent path deliberately
+// bypasses xiaozhi's Assets::Apply() (which is what would normally call
+// srmodel_load + AudioService::SetModelsList). So we replicate just the model load
+// here, using the same Assets singleton the speech-bubble font already reads from,
+// and inject the result into the two AFE engines. Returns nullptr on failure
+// (voice features are then disabled but the rest of the agent still runs).
+static srmodel_list_t* load_sr_models()
+{
+    auto& assets = Assets::GetInstance();
+
+    void* ptr   = nullptr;
+    size_t size = 0;
+    if (!assets.GetAssetData("index.json", ptr, size)) {
+        mclog::tagError(_tag, "assets index.json not found; SR models unavailable");
+        return nullptr;
+    }
+
+    ArduinoJson::JsonDocument doc;
+    if (ArduinoJson::deserializeJson(doc, static_cast<const char*>(ptr), size)) {
+        mclog::tagError(_tag, "assets index.json parse failed");
+        return nullptr;
+    }
+    const char* name = doc["srmodels"].as<const char*>();
+    if (name == nullptr) {
+        mclog::tagError(_tag, "assets index.json has no srmodels entry");
+        return nullptr;
+    }
+    // Copy the filename before the next GetAssetData() reuses ptr/size.
+    const std::string srmodels_file = name;
+
+    if (!assets.GetAssetData(srmodels_file, ptr, size)) {
+        mclog::tagError(_tag, "srmodels file '{}' not found in assets", srmodels_file.c_str());
+        return nullptr;
+    }
+    // srmodel_load references the data in place; the assets partition stays mmap'd
+    // for the lifetime of the process, so the pointer remains valid.
+    srmodel_list_t* models = srmodel_load(ptr);
+    if (models == nullptr) {
+        mclog::tagError(_tag, "srmodel_load failed");
+    }
+    return models;
+}
+
+// All three of the following run only on the session loop task, so they own the
+// state machine without locking. The AFE Start/Stop calls are event-bit toggles
+// (thread-safe), and feeding a stopped AFE is an internal no-op.
+
+static void enter_sleeping()
+{
+    g_sessionActive  = false;
+    g_closeRequested = false;
+    g_startRequested = false;  // drop any tap queued during the session
+    if (g_vc) {
+        g_vc->Stop();
+    }
+    if (g_wake) {
+        g_wake->Start();
+    }
+    g_state = State::Sleeping;
+    faceStatus(Lang::Strings::STANDBY);
+}
+
+static void start_session()
+{
+    if (g_client) {
+        g_client->sendSessionStart();  // empty id -> server assigns one
+    }
+    // Clear any close left over from the previous session (a late
+    // session.closed{client} for our own end can land after we slept).
+    g_closeRequested = false;
+    g_sessionActive  = true;
+    g_turnComplete   = false;
+    g_speakingShown  = false;
+    if (g_wake) {
+        g_wake->Stop();
+    }
+    if (g_vc) {
+        g_vc->Start();
+    }
+    g_state = State::Listening;
+    faceStatus(Lang::Strings::LISTENING);
+    faceSpeech("system", "");
+}
+
+static void end_session(bool notifyServer)
+{
+    if (notifyServer && g_client) {
+        g_client->sendSessionEnd();  // -> server replies session.closed{reason:"client"}
+    }
+    enter_sleeping();
+}
+
+// Wire the AFE callbacks. These fire from the AFE engines' own internal tasks.
+// We keep them light: the wake callback only raises a flag, and the voice
+// callbacks frame the utterance. Framing (input.audio.start / chunks / end) is all
+// driven from the single AFE-VC task, so the three stay correctly ordered without
+// extra synchronization.
+static void wire_afe()
+{
+    if (g_wake) {
+        g_wake->OnWakeWordDetected([](const std::string& /*wake_word*/) {
+            // AfeWakeWord stops itself on detection; just ask the loop to start.
+            g_startRequested = true;
+        });
+    }
+
+    if (!g_vc) {
+        return;
+    }
+
+    g_vc->OnVadStateChange([](bool speaking) {
+        if (!g_sessionActive.load()) {
+            return;  // only meaningful inside an active session
+        }
+        if (speaking) {
+            // Utterance onset -> begin streaming this turn.
+            if (g_state.load() == State::Listening && g_client && g_client->sendInputAudioStart()) {
+                g_state = State::Capturing;
+                faceStatus(Lang::Strings::LISTENING);
+            }
+        } else {
+            // Utterance end -> let the server generate the response.
+            if (g_state.load() == State::Capturing) {
+                if (g_client) {
+                    g_client->sendInputAudioEnd();
+                }
+                g_turnComplete  = false;
+                g_speakingShown = false;
+                g_state         = State::Responding;
+            }
+        }
+    });
+
+    g_vc->OnOutput([](std::vector<int16_t>&& pcm) {
+        // Processed mono 16k PCM. Send only while capturing: during Responding the
+        // device is half-duplex (no audio frames), so this never interleaves with
+        // the image binary frames the action worker may be sending.
+        if (g_state.load() == State::Capturing && g_client) {
+            g_client->sendAudioChunk(pcm.data(), pcm.size());
+        }
+    });
+}
+
+/* -------------------------------------------------------------------------- */
 /*                           Backend event callbacks                          */
 /* -------------------------------------------------------------------------- */
 
@@ -231,11 +413,12 @@ static void wire_callbacks()
     BackendCallbacks cb;
 
     cb.onReady = []() {
-        g_state         = State::Idle;
+        // The session loop drives the actual Sleeping reset (AFE start) after the
+        // connect handshake; here we only refresh the flags and the idle face.
         g_turnComplete  = false;
         g_speakingShown = false;
         faceStatus(Lang::Strings::STANDBY);
-        faceSpeech("system", "どうぞ話しかけてください");
+        faceSpeech("system", "「ハイ、スタックチャン」と呼びかけるか画面をタップしてください");
     };
 
     cb.onConnected = []() { mclog::tagInfo(_tag, "connected"); };
@@ -243,17 +426,40 @@ static void wire_callbacks()
     cb.onDisconnected = []() {
         g_audio.flushPlayback();
         drain_action_queue();
-        g_state         = State::Idle;
+        // Drop the session immediately so the AFE-VC callbacks stop sending; the loop
+        // detects the disconnect, reconnects, and resets to Sleeping.
+        g_sessionActive = false;
         g_turnComplete  = false;
         g_speakingShown = false;
         faceSpeech("system", "切断されました");
     };
 
+    cb.onSessionStarted = [](const std::string& sessionId) {
+        mclog::tagInfo(_tag, "session started: {}", sessionId.c_str());
+    };
+
+    cb.onSessionClosed = [](const std::string& sessionId, const std::string& reason) {
+        mclog::tagInfo(_tag, "session closed: {} (reason={})", sessionId.c_str(), reason.c_str());
+        // Server-driven end (tool / idle / restart). The loop returns us to Sleeping
+        // without sending session.end (the server already closed it). Only act while a
+        // session is active: the server also echoes session.closed{reason:"client"}
+        // for our OWN session.end, which arrives AFTER we already slept -- honoring a
+        // stale close would tear down the *next* session right after it starts.
+        if (g_sessionActive.load()) {
+            g_closeRequested = true;
+        }
+    };
+
     cb.onText = [](const std::string& text) { faceSpeech("assistant", text.c_str()); };
 
     cb.onAudioStart = [](const std::string& /*id*/, AudioMime mime) {
-        g_state          = State::Responding;
         g_needHeaderStrip = (mime == AudioMime::Wav);
+        // Go half-duplex for playback. Only force Responding from Listening; if we are
+        // still Capturing, leave the Capturing->Responding transition to the AFE-VC
+        // task so its input.audio.end is still sent (the utterance framing stays on a
+        // single task -- no dropped boundary, no cross-task chunk-after-end race).
+        State expected = State::Listening;
+        g_state.compare_exchange_strong(expected, State::Responding);
         if (!g_speakingShown.exchange(true)) {
             faceStatus(Lang::Strings::SPEAKING);
         }
@@ -351,158 +557,98 @@ static bool connect_with_retry()
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                Capture loop                                 */
+/*                                Session loop                                 */
 /* -------------------------------------------------------------------------- */
 
-static int mean_abs(const std::vector<int16_t>& frame)
+// Reads the codec and feeds the active AFE, owns the session state machine, and
+// keeps the connection alive. Utterance framing (Listening -> Capturing ->
+// Responding) is driven by the AFE-VC callbacks; this loop handles session
+// open/close, the 1-minute idle timer, and the Responding -> Listening hand-back.
+static void session_loop()
 {
-    if (frame.empty()) {
-        return 0;
-    }
-    int64_t sum = 0;
-    for (int16_t s : frame) {
-        sum += std::abs(static_cast<int>(s));
-    }
-    return static_cast<int>(sum / static_cast<int64_t>(frame.size()));
-}
-
-static void capture_loop()
-{
-    constexpr int kFrameMs  = AudioPipeline::kFrameMs;  // 20
-    const int prerollFrames = 300 / kFrameMs;           // ~300ms pre-roll
-
-    std::deque<std::vector<int16_t>> preroll;
+    constexpr int kFrameMs = AudioPipeline::kFrameMs;  // 20
     std::vector<int16_t> frame;
-    int onsetMs    = 0;  // accumulated voiced time of a tentative onset
-    int onsetGapMs = 0;  // trailing gap within a tentative onset (cancels it if long)
-    int speechMs   = 0;
-    int silenceMs  = 0;
+    int idleMs = 0;
 
     while (1) {
         // Reading paces this loop at ~one frame per kFrameMs (codec is real-time).
-        if (!g_audio.captureFrame16k(frame)) {
+        // The frame is 16k with every input channel interleaved (mic + AEC-ref).
+        if (!g_audio.captureFrame2ch16k(frame)) {
             GetHAL().delay(kFrameMs);
             continue;
         }
 
         if (g_client == nullptr || !g_client->isConnected()) {
             connect_with_retry();
-            // Fresh connection: drop any half-built capture state so the first
-            // post-reconnect utterance doesn't inherit stale pre-roll / VAD counters.
-            preroll.clear();
-            onsetMs    = 0;
-            onsetGapMs = 0;
-            speechMs   = 0;
-            silenceMs  = 0;
+            enter_sleeping();  // fresh connection: wake-word listening, no session
+            idleMs = 0;
             continue;
         }
         if (!g_client->isReady()) {
             continue;
         }
 
-        const int energy = mean_abs(frame);
+        // ---- Sleeping: feed the wake-word engine; a tap / wake / head-pet opens a
+        //      session. In-session taps are ignored (start_session only runs here).
+        if (!g_sessionActive.load()) {
+            if (g_wake) {
+                g_wake->Feed(frame);
+            }
+            // Ignore (and clear) start requests when voice is disabled (no models /
+            // codec): without the voice processor a session would just sit in
+            // Listening with nothing to send. The face already shows the error.
+            if (g_startRequested.exchange(false) && g_vc) {
+                start_session();
+                idleMs = 0;
+            }
+            continue;
+        }
+
+        // ---- Active session.
+        // Server-driven close (tool / idle / restart) takes priority.
+        if (g_closeRequested.exchange(false)) {
+            end_session(/*notifyServer=*/false);
+            idleMs = 0;
+            continue;
+        }
+
+        // Feed the voice processor unless a response is playing (half-duplex: the mic
+        // is dropped while Responding so the speaker output isn't picked up).
+        if (g_state.load() != State::Responding) {
+            if (g_vc) {
+                g_vc->Feed(std::move(frame));
+            }
+        }
 
         switch (g_state.load()) {
-            case State::Idle: {
-                // Don't listen while the tail of a response is still playing.
-                if (g_audio.isPlaying()) {
-                    break;
-                }
-
-                preroll.push_back(frame);
-
-                // Accumulate voiced time of a tentative onset. Brief intra-word dips
-                // (still above vadKeepRms) keep building; only a sustained gap
-                // (>= vadSilenceMs) cancels the onset. This is what discards short
-                // blips (coughs/clicks) that never reach vadMinSpeechMs.
-                if (energy >= g_cfg.vadStartRms) {
-                    onsetMs += kFrameMs;
-                    onsetGapMs = 0;
-                } else if (onsetMs > 0) {
-                    if (energy >= g_cfg.vadKeepRms) {
-                        onsetMs += kFrameMs;
-                        onsetGapMs = 0;
-                    } else {
-                        onsetGapMs += kFrameMs;
-                        if (onsetGapMs >= g_cfg.vadSilenceMs) {
-                            onsetMs    = 0;  // tentative onset was just noise
-                            onsetGapMs = 0;
-                        }
+            case State::Listening:
+                // 1 minute of continuous post-playback silence -> client end. A VAD
+                // onset (-> Capturing) or any response playback resets the timer.
+                if (!g_audio.isPlaying()) {
+                    idleMs += kFrameMs;
+                    if (idleMs >= kSessionIdleMs) {
+                        end_session(/*notifyServer=*/true);
+                        idleMs = 0;
                     }
-                }
-
-                // Until an onset is building, keep only the rolling pre-roll window.
-                // While it builds, retain the whole head so nothing is lost on commit
-                // (bounded so a never-committing case can't grow without limit).
-                const int headCap = prerollFrames + g_cfg.vadMinSpeechMs / kFrameMs + 4;
-                const int trimTo  = (onsetMs > 0) ? headCap : prerollFrames;
-                while (static_cast<int>(preroll.size()) > trimTo) {
-                    preroll.pop_front();
-                }
-
-                // Commit only once enough voiced audio has accumulated. Gating on
-                // vadMinSpeechMs (not a short debounce) rejects sub-threshold noises.
-                if (onsetMs >= g_cfg.vadMinSpeechMs) {
-                    if (!g_client->sendInputAudioStart()) {
-                        onsetMs    = 0;
-                        onsetGapMs = 0;
-                        break;
-                    }
-                    faceStatus(Lang::Strings::LISTENING);
-                    faceSpeech("system", "");
-                    const int flushed = static_cast<int>(preroll.size());
-                    for (auto& f : preroll) {
-                        g_client->sendAudioChunk(f.data(), f.size());
-                    }
-                    preroll.clear();
-                    // The pre-roll already contains the onset frames.
-                    speechMs   = flushed * kFrameMs;
-                    silenceMs  = 0;
-                    onsetMs    = 0;
-                    onsetGapMs = 0;
-                    g_state    = State::Capturing;
                 }
                 break;
-            }
 
-            case State::Capturing: {
-                g_client->sendAudioChunk(frame.data(), frame.size());
-                speechMs += kFrameMs;
-
-                if (energy < g_cfg.vadKeepRms) {
-                    silenceMs += kFrameMs;
-                } else {
-                    silenceMs = 0;
-                }
-
-                const bool tooLong   = speechMs >= g_cfg.vadMaxUtteranceMs;
-                const bool endOfSpeech = silenceMs >= g_cfg.vadSilenceMs;
-
-                if (endOfSpeech || tooLong) {
-                    g_client->sendInputAudioEnd();
-                    g_turnComplete  = false;
-                    g_speakingShown = false;
-                    g_state         = State::Responding;
-                    speechMs        = 0;
-                    silenceMs       = 0;
-                }
+            case State::Capturing:
+                idleMs = 0;  // utterance framing handled by the AFE-VC callbacks
                 break;
-            }
 
-            case State::Responding: {
-                // Mic is ignored while responding (half-duplex). When the server
-                // says the turn is done and all audio has drained, go back to idle.
+            case State::Responding:
+                idleMs = 0;
+                // Turn done and all audio drained -> listen for the next turn
+                // (multi-turn: no re-wake needed within a session).
                 if (g_turnComplete.load() && !g_audio.isPlaying()) {
-                    g_state = State::Idle;
-                    faceStatus(Lang::Strings::STANDBY);
-                    // Start the next utterance from a clean slate (no stale pre-roll
-                    // captured during the previous turn / response tail).
-                    preroll.clear();
-                    onsetMs    = 0;
-                    onsetGapMs = 0;
+                    g_state = State::Listening;
+                    faceStatus(Lang::Strings::LISTENING);
                 }
                 break;
-            }
+
+            case State::Sleeping:
+                break;  // guarded out above
         }
     }
 }
@@ -527,6 +673,23 @@ void start()
         LvglLockGuard lock;
         face()->SetupUI();
         GetHAL().bootLogo.reset();
+    }
+
+    // 2a) Tap-to-start. The avatar panel created by SetupUI covers the whole screen
+    //     and has its own onClick (a no-op in agent mode -- is_xiaozhi_ready() is
+    //     false), and LVGL clicks don't bubble to the screen, so a screen-level
+    //     handler would never see a tap on the avatar. Subscribe to the panel's
+    //     onClick instead (uitk::Signal allows multiple subscribers). Honored only
+    //     while sleeping; in-session taps are ignored by the loop / start_session.
+    if (GetStackChan().hasAvatar()) {
+        auto* panel = static_cast<stackchan::avatar::DefaultAvatar&>(GetStackChan().avatar()).getPanel();
+        if (panel != nullptr) {
+            panel->onClick().connect([]() {
+                if (!g_sessionActive.load()) {
+                    g_startRequested = true;
+                }
+            });
+        }
     }
 
     // 2b) Swap the speech-bubble font to the full-CJK cbin font embedded in the assets
@@ -566,11 +729,49 @@ void start()
         mclog::tagError(_tag, "audio init failed");
     }
 
-    // 7) Connect to the backend and wait for ready.
+    // 6b) Speech engines. Load the ESP-SR models from the assets partition and bring
+    //      up both AFE instances (wake word for sleep, voice processing for an active
+    //      session). Each spawns its own internal task; we toggle them with Start/Stop
+    //      as the session opens and closes. If the models are missing we log and carry
+    //      on -- voice is disabled but the face / device tools still work.
+    g_models = load_sr_models();
+    AudioCodec* codec = Board::GetInstance().GetAudioCodec();
+    if (g_models != nullptr && codec != nullptr) {
+        // Voice processor first: it only borrows g_models (reads NS/VAD model names)
+        // and never frees it. The wake engine is created second because
+        // ~AfeWakeWord esp_srmodel_deinit()s the shared list -- so if its Initialize
+        // fails we release() (leak the small zombie) instead of reset()ing, which
+        // would tear g_models out from under the voice processor mid-run.
+        g_vc = std::make_unique<AfeAudioProcessor>();
+        g_vc->Initialize(codec, kVcFrameMs, g_models);  // half-duplex: device AEC stays off
+
+        g_wake = std::make_unique<AfeWakeWord>();
+        if (!g_wake->Initialize(codec, g_models)) {
+            mclog::tagError(_tag, "wake word init failed; tap/head-pet start only");
+            g_wake.release();  // do NOT free the shared models that g_vc still uses
+        }
+        wire_afe();
+    } else {
+        mclog::tagError(_tag, "SR models/codec unavailable; voice session disabled");
+        faceSpeech("system", "音声モデル未検出");
+    }
+
+    // 6c) Head-pet (optional) shares the session-start entry: a press while sleeping
+    //      opens a session, same as a tap or the wake word. In-session petting is left
+    //      to the avatar's own head-pet behaviour.
+    GetHAL().onHeadPetGesture.connect([](HeadPetGesture gesture) {
+        if (gesture == HeadPetGesture::Press && !g_sessionActive.load()) {
+            g_startRequested = true;
+        }
+    });
+
+    // 7) Connect to the backend and wait for ready, then drop into the sleeping
+    //    (wake-word) state so we are immediately listening for a tap / wake word.
     connect_with_retry();
+    enter_sleeping();
 
     // 8) Run forever.
-    capture_loop();
+    session_loop();
 }
 
 }  // namespace custom_agent

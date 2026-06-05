@@ -200,6 +200,17 @@ void BackendClient::handleText(const char* data, size_t len)
         if (cb_.onAction) {
             cb_.onAction(id ? id : "", name ? name : "", args);
         }
+    } else if (std::strcmp(type, "session.started") == 0) {
+        const char* sid = doc["sessionId"].as<const char*>();
+        if (cb_.onSessionStarted) {
+            cb_.onSessionStarted(sid ? sid : "");
+        }
+    } else if (std::strcmp(type, "session.closed") == 0) {
+        const char* sid    = doc["sessionId"].as<const char*>();
+        const char* reason = doc["reason"].as<const char*>();
+        if (cb_.onSessionClosed) {
+            cb_.onSessionClosed(sid ? sid : "", reason ? reason : "");
+        }
     } else if (std::strcmp(type, "error") == 0) {
         const char* msg = doc["message"].as<const char*>();
         bool fatal      = doc["fatal"].as<bool>();
@@ -210,6 +221,30 @@ void BackendClient::handleText(const char* data, size_t len)
     } else {
         mclog::tagInfo(_tag, "ignoring message type '{}'", type);
     }
+}
+
+bool BackendClient::sendSessionStart(const std::string& sessionId)
+{
+    if (!isConnected()) {
+        return false;
+    }
+    ArduinoJson::JsonDocument doc;
+    doc["type"] = "session.start";
+    if (!sessionId.empty()) {
+        doc["sessionId"] = sessionId;  // omit -> server assigns one
+    }
+    std::string out;
+    ArduinoJson::serializeJson(doc, out);
+    return ws_->Send(out);
+}
+
+bool BackendClient::sendSessionEnd()
+{
+    if (!isConnected()) {
+        return false;
+    }
+    static const std::string msg = R"({"type":"session.end"})";
+    return ws_->Send(msg);
 }
 
 bool BackendClient::sendInputAudioStart()

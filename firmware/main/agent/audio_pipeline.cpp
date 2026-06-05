@@ -46,7 +46,7 @@ bool AudioPipeline::init()
     // input frames per ~20ms at the codec rate, all channels interleaved
     const int inFrames = inRate_ * kFrameMs / 1000;
     readBuf_.assign(static_cast<size_t>(inFrames) * inChannels_, 0);
-    micBuf_.assign(static_cast<size_t>(inFrames), 0);
+    prevSamples_.assign(static_cast<size_t>(inChannels_), 0);
 
     playQueue_ = xQueueCreate(kPlayQueueDepth, sizeof(PcmBuf));
     if (playQueue_ == nullptr) {
@@ -75,7 +75,7 @@ void AudioPipeline::deinit()
     }
 }
 
-bool AudioPipeline::captureFrame16k(std::vector<int16_t>& out)
+bool AudioPipeline::captureFrame2ch16k(std::vector<int16_t>& out)
 {
     if (codec_ == nullptr) {
         return false;
@@ -89,41 +89,40 @@ bool AudioPipeline::captureFrame16k(std::vector<int16_t>& out)
     if (!codec_->InputData(readBuf_)) {
         return false;
     }
-    const int total = static_cast<int>(readBuf_.size());
+    const int total    = static_cast<int>(readBuf_.size());
+    const int ch       = inChannels_;
+    const int inFrames = total / ch;
 
-    // Extract mic channel (index 0 of each interleaved frame).
-    const int inFrames = total / inChannels_;
-    if (inChannels_ == 1) {
-        std::memcpy(micBuf_.data(), readBuf_.data(), inFrames * sizeof(int16_t));
-    } else {
-        for (int i = 0; i < inFrames; ++i) {
-            micBuf_[i] = readBuf_[static_cast<size_t>(i) * inChannels_];
-        }
-    }
-
-    // No resampling needed if the codec already runs at the target rate.
+    // No resampling needed if the codec already runs at the target rate: hand back
+    // the interleaved frame as-is (all channels preserved).
     if (inRate_ == kOutRate) {
-        out.assign(micBuf_.begin(), micBuf_.begin() + inFrames);
+        out.assign(readBuf_.begin(), readBuf_.begin() + static_cast<size_t>(inFrames) * ch);
         return true;
     }
 
-    // Linear resample inRate_ -> kOutRate, continuous across calls.
+    // Linear resample inRate_ -> kOutRate, continuous across calls. Every channel is
+    // interpolated at the same fractional positions, so the channels stay aligned and
+    // the AEC reference keeps its phase relationship to the mic.
     const float step = static_cast<float>(inRate_) / static_cast<float>(kOutRate);
     out.clear();
-    out.reserve(static_cast<size_t>(inFrames * kOutRate / inRate_) + 2);
+    out.reserve((static_cast<size_t>(inFrames) * kOutRate / inRate_ + 2) * ch);
 
     float t = resamplePos_;
     while (t < inFrames - 1) {
         const int i   = static_cast<int>(t);
         const float f = t - i;
-        int16_t a     = (i < 0) ? prevSample_ : micBuf_[i];
-        int16_t b     = micBuf_[i + 1];
-        out.push_back(static_cast<int16_t>(a + (b - a) * f));
+        for (int c = 0; c < ch; ++c) {
+            const int16_t a = (i < 0) ? prevSamples_[c] : readBuf_[static_cast<size_t>(i) * ch + c];
+            const int16_t b = readBuf_[static_cast<size_t>(i + 1) * ch + c];
+            out.push_back(static_cast<int16_t>(a + (b - a) * f));
+        }
         t += step;
     }
-    // Carry the fractional remainder into the next block.
+    // Carry the fractional remainder and each channel's last sample into the next block.
     resamplePos_ = t - inFrames;
-    prevSample_  = micBuf_[inFrames - 1];
+    for (int c = 0; c < ch; ++c) {
+        prevSamples_[c] = readBuf_[static_cast<size_t>(inFrames - 1) * ch + c];
+    }
 
     return true;
 }
