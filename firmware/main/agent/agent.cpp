@@ -27,6 +27,7 @@
 #include <apps/common/common.h>
 
 #include <mooncake_log.h>
+#include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
@@ -662,6 +663,15 @@ void start()
     mclog::tagInfo(_tag, "start custom agent");
 
     g_cfg = load_config();
+
+    // Silence microlink's per-packet INFO logging. At INFO these tags emit ~3 lines
+    // per received WG packet (UDP RX / WG RX / ACK TX); over the slow console UART
+    // that blocks the network tasks long enough to throttle tunnel throughput below
+    // the audio playback rate -> dropouts. WARN keeps real problems visible. (The raw
+    // "[WG_RX]" printf in wireguard_lwip is silenced separately, in the patch.)
+    esp_log_level_set("ml_net_io", ESP_LOG_WARN);
+    esp_log_level_set("ml_wg_mgr", ESP_LOG_WARN);
+    esp_log_level_set("ml_derp", ESP_LOG_WARN);
 
     // 1) Motion behaviour (same as the xiaozhi path).
     auto& motion = GetStackChan().motion();

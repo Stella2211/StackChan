@@ -18,7 +18,9 @@ namespace custom_agent {
 /**
  * @brief Audio container of a server audio segment, taken from
  *        `output.audio.start.format.mimeType`.
- *        Pcm = "audio/pcm;rate=24000" (route1/live), Wav = "audio/wav" (route2/agent).
+ *        Pcm = "audio/pcm;rate=16000" (route1/live), Wav = "audio/wav" (route2/agent).
+ *        NOTE: the device plays at the codec's fixed 16kHz output rate and does not
+ *        resample; the format's sampleRate is informational only.
  */
 enum class AudioMime : uint8_t {
     Unknown = 0,

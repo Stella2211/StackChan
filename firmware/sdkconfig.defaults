@@ -117,8 +117,13 @@ CONFIG_LWIP_SO_RCVBUF=y
 CONFIG_LWIP_IP4_REASSEMBLY=y
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
 CONFIG_LWIP_TCP_WND_DEFAULT=32768
-# MicroLink tuning: small peer table (we mainly talk to the backend) and no
-# built-in HTTP config server (we provision via NVS; saves ~28KB flash + ~7KB RAM
+# MicroLink tuning: size the peer table to hold the whole tailnet (WIREGUARD_MAX_PEERS=16
+# is the hard ceiling) so the backend (priority peer) never has to evict an LRU peer and
+# reuse its WG slot. With only 4 slots and a 13-node tailnet, the backend intermittently
+# landed on a reused slot whose stale wireguard-lwip handshake state produced an INIT the
+# peer couldn't validate -> device->backend handshake silently failed on some boots.
+# Each ml_peer_t is ~288B in PSRAM, so 16 slots costs only ~3.5KB more than 4 (no SRAM hit).
+# No built-in HTTP config server (we provision via NVS; saves ~28KB flash + ~7KB RAM
 # and avoids a second :80 server clashing with WifiManager's config portal).
-CONFIG_ML_MAX_PEERS=4
+CONFIG_ML_MAX_PEERS=16
 CONFIG_ML_ENABLE_CONFIG_HTTPD=n

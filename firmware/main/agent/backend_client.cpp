@@ -9,11 +9,33 @@
 #include <board.h>
 #include <ArduinoJson.hpp>
 #include <mooncake_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <cstring>
 
 namespace custom_agent {
 
 static constexpr const char* _tag = "agent-ws";
+
+// The ml307 TCP layer (managed component) spawns its socket receive task at FreeRTOS
+// priority 1 -- yet that task is what pulls decrypted bytes off the socket and hands
+// the audio chunks to the playback queue. At prio 1 it loses both cores to the
+// WireGuard manager (prio 7) and the LVGL face/text render (prio 3), starving the
+// audio feed and causing playback dropouts during heavy RX / scrolling. We can't
+// change the component's hard-coded priority, so after connecting we look the task up
+// by name and lift it above LVGL but below the WG/net tasks (so WG still fills the
+// socket first, then this drains it promptly). Best-effort: a silent no-op if the
+// task name ever changes upstream.
+static void raise_rx_task_priority()
+{
+#if (INCLUDE_xTaskGetHandle == 1)
+    TaskHandle_t rx = xTaskGetHandle("tcp_receive");
+    if (rx != nullptr) {
+        vTaskPrioritySet(rx, 6);
+        mclog::tagInfo(_tag, "raised tcp_receive priority -> 6 (audio feed)");
+    }
+#endif
+}
 
 static AudioMime parse_mime(const char* mime)
 {
@@ -120,6 +142,9 @@ bool BackendClient::connect()
         ws_.reset();
         return false;
     }
+    // Lift the just-spawned socket receive task out of its prio-1 starvation so it can
+    // keep the audio playback queue fed under WG/LVGL load (see helper comment).
+    raise_rx_task_priority();
     connected_ = true;
     return true;
 }

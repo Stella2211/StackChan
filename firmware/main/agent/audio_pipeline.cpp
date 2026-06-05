@@ -21,7 +21,15 @@ struct PcmBuf {
     size_t samples;
 };
 
-static constexpr int kPlayQueueDepth = 16;
+// Playback jitter buffer depth (in chunks). This is deliberately deep: the WS/TCP
+// receive task that feeds enqueuePcm() runs at a very low priority and shares the
+// cores with the WireGuard manager (prio 7, core 1) and LVGL (prio 3, core 1), so
+// audio bytes arrive in bursts with multi-100ms starvation gaps. A deep queue lets
+// a burst (often a whole segment) buffer ahead and drain smoothly, decoupling
+// playback from receive jitter. Each item is one ~4KB server chunk, so 96 holds
+// ~12s of 16kHz mono audio (<=384KB PSRAM peak). Playback still starts on the first
+// chunk, so this adds buffering slack, not latency.
+static constexpr int kPlayQueueDepth = 96;
 
 bool AudioPipeline::init()
 {
@@ -55,7 +63,13 @@ bool AudioPipeline::init()
     }
 
     running_ = true;
-    xTaskCreatePinnedToCore(playTaskTrampoline, "agent_play", 4096, this, 4, &playTaskHdl_, 1);
+    // Priority 8: above the microlink WireGuard/net tasks (prio 7) and LVGL (prio 3)
+    // so refilling the small (~90ms) I2S DMA buffer is never preempted by WG crypto
+    // or a face/text render -- an under-prioritized play task was a source of dropouts.
+    // Safe to sit this high because the task spends almost all its time blocked in
+    // i2s_channel_write (DMA back-pressure), yielding the core; it only needs the CPU
+    // for the brief per-chunk memcpy, so it cannot starve the network tasks.
+    xTaskCreatePinnedToCore(playTaskTrampoline, "agent_play", 4096, this, 8, &playTaskHdl_, 1);
 
     return true;
 }

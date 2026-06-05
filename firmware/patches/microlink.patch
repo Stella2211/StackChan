@@ -1,5 +1,53 @@
+diff --git a/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c b/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c
+index f974c67..c4d81dd 100644
+--- a/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c
++++ b/components/microlink/components/wireguard_lwip/src/wireguard-platform-esp32.c
+@@ -7,6 +7,7 @@
+ #include "esp_random.h"
+ #include "esp_timer.h"
+ #include "lwip/sys.h"
++#include <sys/time.h>
+ #include <string.h>
+ 
+ /* ============================================================================
+@@ -19,16 +20,28 @@ uint32_t wireguard_sys_now() {
+ }
+ 
+ void wireguard_tai64n_now(uint8_t *output) {
+-    // TAI64N format: 8 bytes seconds + 4 bytes nanoseconds
+-    // For simplicity, use Unix epoch time
+-    uint64_t now_us = esp_timer_get_time();
+-    uint64_t seconds = now_us / 1000000ULL;
+-    uint32_t nanoseconds = (now_us % 1000000ULL) * 1000;
++    // TAI64N format: 8 bytes seconds + 4 bytes nanoseconds.
++    //
++    // This timestamp is WireGuard's anti-replay token ("Silence is a Virtue",
++    // wireguard.c): the RESPONDER records the greatest timestamp it has seen from each
++    // peer and SILENTLY DROPS any handshake initiation whose timestamp is <= that one.
++    // It therefore MUST be wall-clock time, not uptime. The previous implementation used
++    // esp_timer_get_time() (microseconds since boot), so our handshake timestamp reset to
++    // ~0 on every reboot; after the first session the responder kept the larger timestamp
++    // from the prior boot and rejected all our re-handshakes as replays (initiations got
++    // no response) until its peer state happened to be torn down -> intermittent
++    // "connects once, then dead after reboot" failures. The device syncs real time over
++    // SNTP (hal_network.cpp), so gettimeofday() is correct and, crucially, monotonic
++    // across reboots.
++    struct timeval tv;
++    gettimeofday(&tv, NULL);
++    uint64_t seconds = (uint64_t)tv.tv_sec;
++    uint32_t nanoseconds = (uint32_t)tv.tv_usec * 1000u;
+ 
+-    // Log raw uptime before TAI offset (only every ~5s to avoid spam)
++    // Log every ~5s to confirm real epoch time (not uptime) is in use.
+     static uint64_t last_log_s = 0;
+     if (seconds - last_log_s >= 5) {
+-        printf("[TAI64N] uptime=%llu s, nano=%lu\n", (unsigned long long)seconds, (unsigned long)nanoseconds);
++        printf("[TAI64N] epoch=%llu s, nano=%lu\n", (unsigned long long)seconds, (unsigned long)nanoseconds);
+         last_log_s = seconds;
+     }
+ 
 diff --git a/components/microlink/components/wireguard_lwip/src/wireguardif.c b/components/microlink/components/wireguard_lwip/src/wireguardif.c
-index 6627fd0..983c783 100644
+index 6627fd0..a290ab7 100644
 --- a/components/microlink/components/wireguard_lwip/src/wireguardif.c
 +++ b/components/microlink/components/wireguard_lwip/src/wireguardif.c
 @@ -537,10 +537,21 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
@@ -27,6 +75,30 @@ index 6627fd0..983c783 100644
  									pbuf = NULL;
  								} else {
  									WG_DEBUG("[WG_RX_IP] DROPPED: dest_ok=false\n");
+@@ -755,12 +766,17 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
+ 
+ 	uint8_t type = wireguard_get_message_type(data, len);
+ 
+-	// Always log incoming WG packets (critical for debugging handshake issues)
+-	printf("[WG_RX] type=%d (%s) len=%u from %s:%u\n",
+-		type,
+-		type == 1 ? "INIT" : type == 2 ? "RESP" : type == 3 ? "COOKIE" : type == 4 ? "DATA" : "?",
+-		(unsigned)len,
+-		ip_addr_isany(addr) ? "DERP" : ipaddr_ntoa(addr), port);
++	// Log only handshake/cookie packets (types 1-3, rare and useful for debugging).
++	// DATA (type 4) arrives once per received packet; printing it floods the console
++	// UART, which blocks this network task long enough to throttle tunnel throughput
++	// below the audio playback rate -> dropouts.
++	if (type != 4) {
++		printf("[WG_RX] type=%d (%s) len=%u from %s:%u\n",
++			type,
++			type == 1 ? "INIT" : type == 2 ? "RESP" : type == 3 ? "COOKIE" : type == 4 ? "DATA" : "?",
++			(unsigned)len,
++			ip_addr_isany(addr) ? "DERP" : ipaddr_ntoa(addr), port);
++	}
+ 
+ 	switch (type) {
+ 		case MESSAGE_HANDSHAKE_INITIATION:
 diff --git a/components/microlink/src/ml_derp.c b/components/microlink/src/ml_derp.c
 index c57fd0f..6748df6 100644
 --- a/components/microlink/src/ml_derp.c

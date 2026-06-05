@@ -6,8 +6,12 @@
 #include <driver/gpio.h>
 
 #define AUDIO_INPUT_REFERENCE    true
-#define AUDIO_INPUT_SAMPLE_RATE  24000
-#define AUDIO_OUTPUT_SAMPLE_RATE 24000
+// CoreS3 は入出力で I2S クロックを共有する（cores3_audio_codec.cc の
+// assert(input_sample_rate_ == output_sample_rate_)）。両者は必ず一致させること。
+// 16kHz: AFE/ESP-SR が要求する入力レートそのもの（入力リサンプリング不要）であり、
+// 出力も 16kHz になることで再生バイト量 = WG 復号負荷 = I2S 負荷が 24kHz 比で約 33% 減る。
+#define AUDIO_INPUT_SAMPLE_RATE  16000
+#define AUDIO_OUTPUT_SAMPLE_RATE 16000
 
 #define AUDIO_I2S_GPIO_MCLK GPIO_NUM_0
 #define AUDIO_I2S_GPIO_WS GPIO_NUM_33

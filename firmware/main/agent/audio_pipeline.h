@@ -40,16 +40,21 @@ public:
     bool init();
     void deinit();
 
-    /// Read one ~20ms codec frame, all input channels interleaved, resampled to
-    /// 16kHz. On CoreS3 that is 2ch [mic, AEC-ref]; channels are preserved so the
-    /// AFE keeps its reference input. `out` is resized to ~kOutSamples * channels.
-    /// Returns false on read failure.
+    /// Read one ~20ms codec frame, all input channels interleaved, at 16kHz. The
+    /// board runs the codec at 16kHz natively (AUDIO_INPUT_SAMPLE_RATE), so this is
+    /// a straight passthrough; the linear resampler below only kicks in if a board
+    /// reports a different input rate. On CoreS3 that is 2ch [mic, AEC-ref]; channels
+    /// are preserved so the AFE keeps its reference input. `out` is resized to
+    /// ~kOutSamples * channels. Returns false on read failure.
     bool captureFrame2ch16k(std::vector<int16_t>& out);
 
     /// Number of interleaved input channels the codec provides (1 or 2).
     int inputChannels() const { return inChannels_; }
 
-    /// Queue one chunk of 24kHz mono s16le PCM for playback (bytes are copied).
+    /// Queue one chunk of 16kHz mono s16le PCM for playback (bytes are copied).
+    /// The codec output runs at AUDIO_OUTPUT_SAMPLE_RATE (16kHz) with no resampling,
+    /// so the server must send PCM at this rate (output.audio.start.format is
+    /// informational only -- it is not honored on playback).
     void enqueuePcm(const uint8_t* bytes, size_t len);
 
     /// True while there is audio queued or actively being written.

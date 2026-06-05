@@ -141,7 +141,7 @@ bool tailscale_bring_up(const Config& cfg, const std::function<void(const char*)
     mlc.enable_derp       = true;
     mlc.enable_stun       = true;
     mlc.enable_disco      = true;
-    mlc.max_peers         = 4;
+    mlc.max_peers         = 16;  // hold the whole tailnet; avoids WG-slot eviction/reuse (see sdkconfig.defaults)
     mlc.wifi_tx_power_dbm = 0;  // keep the board's default TX power
     mlc.priority_peer_ip  = peerIpHost;
 
