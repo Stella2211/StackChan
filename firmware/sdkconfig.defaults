@@ -127,3 +127,5 @@ CONFIG_LWIP_TCP_WND_DEFAULT=32768
 # and avoids a second :80 server clashing with WifiManager's config portal).
 CONFIG_ML_MAX_PEERS=16
 CONFIG_ML_ENABLE_CONFIG_HTTPD=n
+
+CONFIG_STACKCHAN_OTA_URL="http://100.102.53.22:8787/ota/check"

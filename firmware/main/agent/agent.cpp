@@ -124,6 +124,31 @@ struct ActionItem {
 };
 QueueHandle_t g_actionQueue = nullptr;
 
+// ---- Uplink (mic -> server) audio TX, decoupled from the AFE fetch task ------------
+// The AFE voice processor delivers processed PCM on its OWN internal fetch task
+// (AfeAudioProcessor::AudioProcessorTask). That task must never stop calling fetch():
+// if it blocks, the AFE FEED ringbuffer overflows ("Ringbuffer of AFE(FEED) is full")
+// and all further mic audio is lost until the session dies. A WebSocket send is a
+// *blocking* socket write (EspTcp::Send loops on send()), and over the tailnet/WireGuard
+// tunnel a slow/back-pressured uplink can wedge that write for seconds -- which used to
+// stall the AFE fetch task and silently kill the whole utterance. So the AFE callbacks
+// never send: they only enqueue here, and a dedicated uplink task drains the queue and
+// does the blocking sends. Symmetric to the playback jitter-buffer on the downlink side.
+enum class TxKind : uint8_t { Start, Chunk, End };
+struct TxItem {
+    TxKind kind;
+    int16_t* pcm;    // Chunk only: PSRAM-allocated mono 16k PCM (freed by the uplink task)
+    size_t samples;  // Chunk only
+};
+QueueHandle_t g_txQueue = nullptr;
+// Chunks are capped below the queue depth so a control frame (Start/End) always has a
+// free slot. Dropping audio under a too-slow uplink only degrades ASR; dropping an End
+// would hang the turn forever. Each chunk is one ~60ms (or the lead) PSRAM buffer, so
+// 300 bounds the backlog at well under 1MB PSRAM and ~9s of audio.
+constexpr int kTxQueueDepth    = 320;
+constexpr int kMaxQueuedChunks = 300;
+std::atomic<unsigned> g_txDropped{0};  // mic chunks dropped because the uplink fell behind
+
 }  // namespace
 
 /* -------------------------------------------------------------------------- */
@@ -263,6 +288,115 @@ static void drain_action_queue()
     }
 }
 
+/* ---------------------------- uplink audio (mic -> server) --------------------------- */
+
+// Audio uplink wrappers, same g_clientMutex guard as the image/result sends above so a
+// reconnect can't free the client out from under a send. Called only on the uplink task.
+static bool client_send_input_audio_start()
+{
+    std::lock_guard<std::mutex> lk(g_clientMutex);
+    return g_client ? g_client->sendInputAudioStart() : false;
+}
+static bool client_send_audio_chunk(const int16_t* pcm, size_t samples)
+{
+    std::lock_guard<std::mutex> lk(g_clientMutex);
+    return g_client ? g_client->sendAudioChunk(pcm, samples) : false;
+}
+static bool client_send_input_audio_end()
+{
+    std::lock_guard<std::mutex> lk(g_clientMutex);
+    return g_client ? g_client->sendInputAudioEnd() : false;
+}
+
+// True only while the backend is connected. The capture gate checks this (instead of a
+// real send) to decide whether to commit a turn, so the AFE task never blocks the socket.
+static bool uplink_connected()
+{
+    std::lock_guard<std::mutex> lk(g_clientMutex);
+    return g_client && g_client->isConnected();
+}
+
+// The next three run on the AFE fetch task and MUST NOT block (see g_txQueue note).
+// Control frames use a 0-tick send that always succeeds thanks to the chunk cap below.
+static void tx_enqueue_control(TxKind kind)
+{
+    if (g_txQueue == nullptr) {
+        return;
+    }
+    TxItem item{kind, nullptr, 0};
+    if (xQueueSend(g_txQueue, &item, 0) != pdTRUE) {
+        // Unreachable in practice: kMaxQueuedChunks leaves headroom for control frames.
+        mclog::tagError(_tag, "uplink control frame dropped (queue full)");
+    }
+}
+
+static void tx_enqueue_chunk(const int16_t* pcm, size_t samples)
+{
+    if (g_txQueue == nullptr || pcm == nullptr || samples == 0) {
+        return;
+    }
+    // Bound in-flight chunks: protects PSRAM and keeps Start/End slots free. A backlog at
+    // the cap means the uplink can't sustain 32KB/s; drop this chunk (an audio gap) rather
+    // than block the AFE task or starve a control frame.
+    if (uxQueueMessagesWaiting(g_txQueue) >= kMaxQueuedChunks) {
+        if ((g_txDropped.fetch_add(1) % 50) == 0) {
+            mclog::tagWarn(_tag, "uplink slow: dropping mic chunks ({} total)", g_txDropped.load());
+        }
+        return;
+    }
+    auto* buf = static_cast<int16_t*>(heap_caps_malloc(samples * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (buf == nullptr) {
+        buf = static_cast<int16_t*>(heap_caps_malloc(samples * sizeof(int16_t), MALLOC_CAP_8BIT));
+    }
+    if (buf == nullptr) {
+        return;
+    }
+    std::memcpy(buf, pcm, samples * sizeof(int16_t));
+    TxItem item{TxKind::Chunk, buf, samples};
+    if (xQueueSend(g_txQueue, &item, 0) != pdTRUE) {
+        heap_caps_free(buf);
+    }
+}
+
+// Drop everything queued (on disconnect / session end) so a new utterance never trails
+// stale audio. Any in-flight send on the uplink task completes; only pending items go.
+static void drain_tx_queue()
+{
+    if (g_txQueue == nullptr) {
+        return;
+    }
+    TxItem item;
+    while (xQueueReceive(g_txQueue, &item, 0) == pdTRUE) {
+        if (item.kind == TxKind::Chunk && item.pcm != nullptr) {
+            heap_caps_free(item.pcm);
+        }
+    }
+}
+
+// Drains the uplink queue and does the blocking WebSocket sends off the AFE fetch task.
+// FIFO ordering preserves input.audio.start -> chunks... -> input.audio.end.
+static void uplink_task(void*)
+{
+    while (1) {
+        TxItem item;
+        if (xQueueReceive(g_txQueue, &item, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        switch (item.kind) {
+            case TxKind::Start:
+                client_send_input_audio_start();
+                break;
+            case TxKind::Chunk:
+                client_send_audio_chunk(item.pcm, item.samples);
+                heap_caps_free(item.pcm);
+                break;
+            case TxKind::End:
+                client_send_input_audio_end();
+                break;
+        }
+    }
+}
+
 // Runs built-in device tools off the WS receive task. Serialized (one tool at a
 // time), at a lower priority than audio, so a camera capture/encode or a gesture's
 // inter-keyframe sleeps never stall the socket or the voice path.
@@ -355,6 +489,9 @@ static void enter_sleeping()
     if (g_wake) {
         g_wake->Start();
     }
+    // Drop any mic audio still queued for upload so the next session never trails the
+    // previous utterance (and the PSRAM buffers are freed promptly).
+    drain_tx_queue();
     g_state = State::Sleeping;
     faceStatus(Lang::Strings::STANDBY);
 }
@@ -441,9 +578,9 @@ static void wire_afe()
             if (g_state.load() == State::Capturing) {
                 if (g_captureCommitted) {
                     // A real (committed) utterance was streamed -> let the server respond.
-                    if (g_client) {
-                        g_client->sendInputAudioEnd();
-                    }
+                    // Queue the end marker so it lands after the last chunk (FIFO) without
+                    // blocking this AFE task on the socket.
+                    tx_enqueue_control(TxKind::End);
                     g_turnComplete  = false;
                     g_speakingShown = false;
                     g_state         = State::Responding;
@@ -467,7 +604,7 @@ static void wire_afe()
             return;
         }
         if (g_captureCommitted) {
-            g_client->sendAudioChunk(pcm.data(), pcm.size());
+            tx_enqueue_chunk(pcm.data(), pcm.size());
             return;
         }
 
@@ -490,13 +627,16 @@ static void wire_afe()
             g_pendingPcm.erase(g_pendingPcm.begin(), g_pendingPcm.end() - maxPending);
         }
 
-        if (g_voicedMs >= g_cfg.vadMinSpeechMs && g_client->sendInputAudioStart()) {
+        if (g_voicedMs >= g_cfg.vadMinSpeechMs && uplink_connected()) {
             g_captureCommitted = true;
             // The utterance cleared the gates and is now actually being streamed -- show
             // a friendly "I'm listening" bubble so the user can see their voice is going
-            // through, instead of waiting blindly until the reply arrives.
+            // through, instead of waiting blindly until the reply arrives. The actual
+            // start + lead-audio sends are queued (drained by the uplink task) so this
+            // AFE fetch task never blocks on the socket.
             faceSpeech("system", "きいてるよ！");
-            g_client->sendAudioChunk(g_pendingPcm.data(), g_pendingPcm.size());
+            tx_enqueue_control(TxKind::Start);
+            tx_enqueue_chunk(g_pendingPcm.data(), g_pendingPcm.size());
             g_pendingPcm.clear();
             g_pendingPcm.shrink_to_fit();
         }
@@ -526,6 +666,7 @@ static void wire_callbacks()
     cb.onDisconnected = []() {
         g_audio.flushPlayback();
         drain_action_queue();
+        drain_tx_queue();
         // Drop the session immediately so the AFE-VC callbacks stop sending; the loop
         // detects the disconnect, reconnects, and resets to Sleeping.
         g_sessionActive = false;
@@ -856,6 +997,14 @@ void start()
     //     generously (12 KB) to leave headroom.
     g_actionQueue = xQueueCreate(8, sizeof(ActionItem*));
     xTaskCreatePinnedToCore(action_worker_task, "agent_action", 12288, nullptr, 2, nullptr, tskNO_AFFINITY);
+
+    // 3c) Uplink audio sender. Drains mic PCM to the backend off the AFE fetch task so a
+    //     slow/back-pressured tailnet upload can never wedge fetch() and overflow the AFE
+    //     FEED ringbuffer (which used to silently drop whole utterances). It spends almost
+    //     all its time blocked in the socket send (yielding the core), so it sits below the
+    //     WireGuard/net tasks; pinned to core 0 to stay off core 1's WG/LVGL/playback crowd.
+    g_txQueue = xQueueCreate(kTxQueueDepth, sizeof(TxItem));
+    xTaskCreatePinnedToCore(uplink_task, "agent_uplink", 4096, nullptr, 6, nullptr, 0);
 
     // 4) Idle face while we connect.
     faceStatus(Lang::Strings::STANDBY);
