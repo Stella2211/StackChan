@@ -447,6 +447,8 @@ static void wire_afe()
                     g_turnComplete  = false;
                     g_speakingShown = false;
                     g_state         = State::Responding;
+                    // Bridge the gap until the reply starts so it doesn't look stalled.
+                    faceSpeech("system", "かんがえてるよ…");
                 } else {
                     // Never cleared the gates (too short / too quiet) -> discard it
                     // silently and keep listening. The server was never told.
@@ -490,6 +492,10 @@ static void wire_afe()
 
         if (g_voicedMs >= g_cfg.vadMinSpeechMs && g_client->sendInputAudioStart()) {
             g_captureCommitted = true;
+            // The utterance cleared the gates and is now actually being streamed -- show
+            // a friendly "I'm listening" bubble so the user can see their voice is going
+            // through, instead of waiting blindly until the reply arrives.
+            faceSpeech("system", "きいてるよ！");
             g_client->sendAudioChunk(g_pendingPcm.data(), g_pendingPcm.size());
             g_pendingPcm.clear();
             g_pendingPcm.shrink_to_fit();
