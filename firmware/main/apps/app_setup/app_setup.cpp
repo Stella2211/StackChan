@@ -84,6 +84,12 @@ void AppSetup::onOpen()
                   _need_warm_reset = true;
                   _worker          = std::make_unique<AgentBackendWorker>();
               }},
+             {"Voice",
+              [&]() {
+                  _destroy_menu    = true;
+                  _need_warm_reset = true;
+                  _worker          = std::make_unique<AgentVoiceWorker>();
+              }},
              {"Power Saving",
               [&]() {
                   _destroy_menu    = true;

@@ -84,6 +84,17 @@ std::atomic<bool> g_turnComplete{false};
 std::atomic<bool> g_speakingShown{false};
 std::atomic<bool> g_needHeaderStrip{false};
 
+// Per-turn capture gating (min volume + min duration), layered on top of the AFE's
+// model VAD. A candidate utterance (AFE onset) is buffered but NOT announced to the
+// server until it clears both gates: at least g_cfg.vadMinSpeechMs of "voiced" audio,
+// where a frame counts as voiced only if its mean-abs amplitude reaches g_cfg.vadStartRms.
+// Short blips / quiet noise the model VAD still flags thus never open a turn. All three
+// are touched only on the AFE-VC task (OnVadStateChange + OnOutput run serialized there),
+// so they need no locking.
+std::vector<int16_t> g_pendingPcm;   // onset audio held back until commit, then flushed
+int g_voicedMs          = 0;         // accumulated ms of frames >= vadStartRms
+bool g_captureCommitted = false;     // true once input.audio.start + the lead audio were sent
+
 // Wake-word ("ハイ、スタックチャン") detection. DISABLED: it was not reliably triggering,
 // and more importantly the WakeNet AFE instance it requires holds ~25KB of *internal*
 // (DMA-capable) RAM permanently -- the exact pool WiFi/lwIP/WireGuard TX buffers need,
@@ -378,6 +389,21 @@ static void end_session(bool notifyServer)
     enter_sleeping();
 }
 
+// Mean absolute amplitude of a mono PCM frame -- the cheap "loudness" measure the
+// vadStartRms threshold is expressed in. INT16_MIN is widened before negating so the
+// abs() can't overflow.
+static int frame_mean_abs(const std::vector<int16_t>& pcm)
+{
+    if (pcm.empty()) {
+        return 0;
+    }
+    int64_t sum = 0;
+    for (int16_t s : pcm) {
+        sum += s < 0 ? -static_cast<int32_t>(s) : s;
+    }
+    return static_cast<int>(sum / static_cast<int64_t>(pcm.size()));
+}
+
 // Wire the AFE callbacks. These fire from the AFE engines' own internal tasks.
 // We keep them light: the wake callback only raises a flag, and the voice
 // callbacks frame the utterance. Framing (input.audio.start / chunks / end) is all
@@ -401,30 +427,72 @@ static void wire_afe()
             return;  // only meaningful inside an active session
         }
         if (speaking) {
-            // Utterance onset -> begin streaming this turn.
-            if (g_state.load() == State::Listening && g_client && g_client->sendInputAudioStart()) {
-                g_state = State::Capturing;
-                faceStatus(Lang::Strings::LISTENING);
+            // Candidate utterance onset. Don't announce it to the server yet: buffer the
+            // audio and wait for the volume/duration gates to clear (see OnOutput) so a
+            // short blip or quiet noise never opens a turn.
+            if (g_state.load() == State::Listening) {
+                g_pendingPcm.clear();
+                g_voicedMs         = 0;
+                g_captureCommitted = false;
+                g_state            = State::Capturing;
             }
         } else {
-            // Utterance end -> let the server generate the response.
+            // Utterance end.
             if (g_state.load() == State::Capturing) {
-                if (g_client) {
-                    g_client->sendInputAudioEnd();
+                if (g_captureCommitted) {
+                    // A real (committed) utterance was streamed -> let the server respond.
+                    if (g_client) {
+                        g_client->sendInputAudioEnd();
+                    }
+                    g_turnComplete  = false;
+                    g_speakingShown = false;
+                    g_state         = State::Responding;
+                } else {
+                    // Never cleared the gates (too short / too quiet) -> discard it
+                    // silently and keep listening. The server was never told.
+                    g_pendingPcm.clear();
+                    g_state = State::Listening;
                 }
-                g_turnComplete  = false;
-                g_speakingShown = false;
-                g_state         = State::Responding;
             }
         }
     });
 
     g_vc->OnOutput([](std::vector<int16_t>&& pcm) {
-        // Processed mono 16k PCM. Send only while capturing: during Responding the
-        // device is half-duplex (no audio frames), so this never interleaves with
-        // the image binary frames the action worker may be sending.
-        if (g_state.load() == State::Capturing && g_client) {
+        // Processed mono 16k PCM. Acted on only while capturing: during Responding the
+        // device is half-duplex (no audio frames), so this never interleaves with the
+        // image binary frames the action worker may be sending.
+        if (g_state.load() != State::Capturing || !g_client) {
+            return;
+        }
+        if (g_captureCommitted) {
             g_client->sendAudioChunk(pcm.data(), pcm.size());
+            return;
+        }
+
+        // Pre-commit: buffer the onset audio and measure it against the gates. Only
+        // frames at/above vadStartRms count toward the "voiced" duration, so quiet noise
+        // never accumulates; once vadMinSpeechMs of voiced audio is reached the turn is
+        // real -> announce it and flush everything buffered so far (no leading clip).
+        const int frameMs = static_cast<int>(pcm.size() * 1000 / AudioPipeline::kOutRate);
+        if (frame_mean_abs(pcm) >= g_cfg.vadStartRms) {
+            g_voicedMs += frameMs;
+        }
+        g_pendingPcm.insert(g_pendingPcm.end(), pcm.begin(), pcm.end());
+
+        // Bound the lead buffer: a long sub-threshold stretch the model still flags as
+        // speech must not grow it without limit. Dropping the oldest (quiet) samples is
+        // safe -- any voiced run long enough to matter would have committed by then.
+        const size_t maxPending =
+            static_cast<size_t>(g_cfg.vadMinSpeechMs + 300) * (AudioPipeline::kOutRate / 1000);
+        if (g_pendingPcm.size() > maxPending) {
+            g_pendingPcm.erase(g_pendingPcm.begin(), g_pendingPcm.end() - maxPending);
+        }
+
+        if (g_voicedMs >= g_cfg.vadMinSpeechMs && g_client->sendInputAudioStart()) {
+            g_captureCommitted = true;
+            g_client->sendAudioChunk(g_pendingPcm.data(), g_pendingPcm.size());
+            g_pendingPcm.clear();
+            g_pendingPcm.shrink_to_fit();
         }
     });
 }

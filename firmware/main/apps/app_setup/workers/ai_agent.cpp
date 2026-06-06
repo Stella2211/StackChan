@@ -18,6 +18,18 @@ static std::string _tag = "Setup-AIAgent";
 namespace {
 static const std::array<const char*, 4> _idle_motion_level_labels = {{"Off", "Low", "Medium", "High"}};
 
+// Index of the first level >= value, clamped to the last level. Used to map a stored
+// config value onto the discrete slider positions below.
+static int level_index_for(const std::vector<int>& levels, int value)
+{
+    for (size_t i = 0; i < levels.size(); ++i) {
+        if (levels[i] >= value) {
+            return static_cast<int>(i);
+        }
+    }
+    return static_cast<int>(levels.size()) - 1;
+}
+
 }  // namespace
 
 XiaozhiPowerSavingWorker::XiaozhiPowerSavingWorker()
@@ -363,4 +375,146 @@ void AgentBackendWorker::update_value_label()
     } else {
         _label_value->setText("Agent  /ws/agent");
     }
+}
+
+AgentVoiceWorker::AgentVoiceWorker()
+{
+    mclog::info("AgentVoiceWorker start");
+
+    _config = custom_agent::load_config();
+
+    // Min. voice length to send: 0.0 .. 2.0 s in 0.1 s (100 ms) steps.
+    for (int ms = 0; ms <= 2000; ms += 100) {
+        _length_levels.push_back(ms);
+    }
+    // Min. voice volume (mean-abs amplitude): 0 .. 2000 in steps of 50.
+    for (int rms = 0; rms <= 2000; rms += 50) {
+        _volume_levels.push_back(rms);
+    }
+
+    const int length_index = level_index_for(_length_levels, _config.vadMinSpeechMs);
+    const int volume_index = level_index_for(_volume_levels, _config.vadStartRms);
+
+    _panel = std::make_unique<Container>(lv_screen_active());
+    _panel->setBgColor(lv_color_hex(0xEDF4FF));
+    _panel->align(LV_ALIGN_CENTER, 0, 0);
+    _panel->setBorderWidth(0);
+    _panel->setSize(320, 240);
+    _panel->setRadius(0);
+    _panel->setPadding(0, 50, 24, 18);
+    _panel->setScrollDir(LV_DIR_VER);
+    _panel->setScrollbarMode(LV_SCROLLBAR_MODE_ACTIVE);
+
+    // ---- Minimum voice length panel ----
+    _panel_length = std::make_unique<Container>(_panel->get());
+    _panel_length->setSize(296, 148);
+    _panel_length->align(LV_ALIGN_TOP_MID, 0, 20);
+    _panel_length->setBgColor(lv_color_hex(0xD2E3FF));
+    _panel_length->setBorderWidth(0);
+    _panel_length->setRadius(18);
+    _panel_length->setPadding(0, 0, 0, 0);
+    _panel_length->removeFlag(LV_OBJ_FLAG_SCROLLABLE);
+
+    _label_length_title = std::make_unique<Label>(_panel_length->get());
+    _label_length_title->setText("Minimum voice length to send:");
+    _label_length_title->setWidth(280);
+    _label_length_title->setTextAlign(LV_TEXT_ALIGN_CENTER);
+    _label_length_title->setTextFont(&lv_font_montserrat_16);
+    _label_length_title->setTextColor(lv_color_hex(0x26206A));
+    _label_length_title->align(LV_ALIGN_TOP_MID, 0, 18);
+
+    _label_length_value = std::make_unique<Label>(_panel_length->get());
+    _label_length_value->setTextFont(&lv_font_montserrat_24);
+    _label_length_value->setTextColor(lv_color_hex(0x26206A));
+    _label_length_value->align(LV_ALIGN_TOP_MID, 0, 64);
+
+    _slider_length = std::make_unique<Slider>(_panel_length->get());
+    _slider_length->align(LV_ALIGN_TOP_MID, 0, 106);
+    _slider_length->setRange(0, _length_levels.size() - 1);
+    _slider_length->setSize(250, 18);
+    _slider_length->setBgColor(lv_color_hex(0x615B9E), LV_PART_KNOB);
+    _slider_length->setBgColor(lv_color_hex(0x615B9E), LV_PART_INDICATOR);
+    _slider_length->setBgColor(lv_color_hex(0xB8D3FD), LV_PART_MAIN);
+    _slider_length->setBgOpa(255);
+    _slider_length->setValue(length_index);
+    _slider_length->onValueChanged().connect([this](int32_t value) { _pending_length_index = value; });
+
+    // ---- Minimum voice volume panel ----
+    _panel_volume = std::make_unique<Container>(_panel->get());
+    _panel_volume->setSize(296, 148);
+    _panel_volume->align(LV_ALIGN_TOP_MID, 0, 188);
+    _panel_volume->setBgColor(lv_color_hex(0xD2E3FF));
+    _panel_volume->setBorderWidth(0);
+    _panel_volume->setRadius(18);
+    _panel_volume->setPadding(0, 0, 0, 0);
+    _panel_volume->removeFlag(LV_OBJ_FLAG_SCROLLABLE);
+
+    _label_volume_title = std::make_unique<Label>(_panel_volume->get());
+    _label_volume_title->setText("Minimum voice volume (louder = stricter):");
+    _label_volume_title->setWidth(280);
+    _label_volume_title->setTextAlign(LV_TEXT_ALIGN_CENTER);
+    _label_volume_title->setTextFont(&lv_font_montserrat_16);
+    _label_volume_title->setTextColor(lv_color_hex(0x26206A));
+    _label_volume_title->align(LV_ALIGN_TOP_MID, 0, 18);
+
+    _label_volume_value = std::make_unique<Label>(_panel_volume->get());
+    _label_volume_value->setTextFont(&lv_font_montserrat_24);
+    _label_volume_value->setTextColor(lv_color_hex(0x26206A));
+    _label_volume_value->align(LV_ALIGN_TOP_MID, 0, 64);
+
+    _slider_volume = std::make_unique<Slider>(_panel_volume->get());
+    _slider_volume->align(LV_ALIGN_TOP_MID, 0, 106);
+    _slider_volume->setRange(0, _volume_levels.size() - 1);
+    _slider_volume->setSize(250, 18);
+    _slider_volume->setBgColor(lv_color_hex(0x615B9E), LV_PART_KNOB);
+    _slider_volume->setBgColor(lv_color_hex(0x615B9E), LV_PART_INDICATOR);
+    _slider_volume->setBgColor(lv_color_hex(0xB8D3FD), LV_PART_MAIN);
+    _slider_volume->setBgOpa(255);
+    _slider_volume->setValue(volume_index);
+    _slider_volume->onValueChanged().connect([this](int32_t value) { _pending_volume_index = value; });
+
+    _btn_confirm = std::make_unique<Button>(_panel->get());
+    apply_button_common_style(*_btn_confirm);
+    _btn_confirm->align(LV_ALIGN_TOP_MID, 0, 356);
+    _btn_confirm->setSize(290, 50);
+    _btn_confirm->label().setText("Confirm");
+    _btn_confirm->onClick().connect([this]() { _confirm_flag = true; });
+
+    update_length_label();
+    update_volume_label();
+}
+
+void AgentVoiceWorker::update()
+{
+    if (_pending_length_index != -1) {
+        _config.vadMinSpeechMs = _length_levels[_pending_length_index];
+        _pending_length_index  = -1;
+        update_length_label();
+    }
+
+    if (_pending_volume_index != -1) {
+        _config.vadStartRms   = _volume_levels[_pending_volume_index];
+        _pending_volume_index = -1;
+        update_volume_label();
+    }
+
+    if (_confirm_flag) {
+        _confirm_flag = false;
+        custom_agent::save_config(_config);
+        mclog::tagInfo(_tag, "agent voice updated: vadMinSpeechMs={} vadStartRms={}", _config.vadMinSpeechMs,
+                       _config.vadStartRms);
+        _is_done = true;
+    }
+}
+
+void AgentVoiceWorker::update_length_label()
+{
+    // Render ms as "X.X s" without floating point (e.g. 300 -> "0.3 s").
+    const int tenths = _config.vadMinSpeechMs / 100;
+    _label_length_value->setText(fmt::format("{}.{} s", tenths / 10, tenths % 10));
+}
+
+void AgentVoiceWorker::update_volume_label()
+{
+    _label_volume_value->setText(fmt::format("{}", _config.vadStartRms));
 }

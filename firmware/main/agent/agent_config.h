@@ -36,12 +36,16 @@ struct Config {
     std::string token;         // auth token (empty -> no token query appended)
     Route route = Route::Agent;
 
-    // On-device VAD (no server-side VAD per the protocol spec)
-    int vadStartRms       = 600;    // mean-abs amplitude to consider as speech onset
-    int vadKeepRms        = 350;    // below this for vadSilenceMs ends the utterance
-    int vadSilenceMs      = 800;    // trailing silence that closes an utterance
-    int vadMinSpeechMs    = 300;    // utterances shorter than this are discarded
-    int vadMaxUtteranceMs = 15000;  // hard cap on a single utterance
+    // On-device utterance gating, layered on top of the ESP-SR model VAD (there is no
+    // server-side VAD per the protocol spec). vadStartRms / vadMinSpeechMs are editable
+    // from Setup > AI.Agent > Voice and applied on the next (warm) boot; see the gate in
+    // agent.cpp's AFE OnOutput/OnVadStateChange. The remaining three are reserved (the
+    // AFE already handles trailing-silence detection internally; no on-device hard cap).
+    int vadStartRms       = 600;    // min mean-abs amplitude for a frame to count as "voiced"
+    int vadKeepRms        = 350;    // reserved (AFE handles trailing-silence detection)
+    int vadSilenceMs      = 800;    // reserved (AFE handles trailing-silence detection)
+    int vadMinSpeechMs    = 300;    // discard utterances with less than this much voiced audio
+    int vadMaxUtteranceMs = 15000;  // reserved (no on-device hard cap enforced yet)
 };
 
 /**

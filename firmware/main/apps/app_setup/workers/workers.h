@@ -386,6 +386,42 @@ private:
 };
 
 /**
+ * @brief Tune the on-device utterance gating used by the custom AI agent: the
+ *        minimum voiced length an utterance must reach before it is sent
+ *        (vadMinSpeechMs, 0.1 s steps) and the minimum volume a frame needs to
+ *        count as speech (vadStartRms). Both are persisted to NVS
+ *        (custom_agent::save_config) and read by the agent at startup, so a warm
+ *        reboot is needed to apply the change.
+ */
+class AgentVoiceWorker : public WorkerBase {
+public:
+    AgentVoiceWorker();
+    void update() override;
+
+private:
+    void update_length_label();
+    void update_volume_label();
+
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel;
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel_length;
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel_volume;
+    std::unique_ptr<uitk::lvgl_cpp::Label> _label_length_title;
+    std::unique_ptr<uitk::lvgl_cpp::Label> _label_length_value;
+    std::unique_ptr<uitk::lvgl_cpp::Slider> _slider_length;
+    std::unique_ptr<uitk::lvgl_cpp::Label> _label_volume_title;
+    std::unique_ptr<uitk::lvgl_cpp::Label> _label_volume_value;
+    std::unique_ptr<uitk::lvgl_cpp::Slider> _slider_volume;
+    std::unique_ptr<uitk::lvgl_cpp::Button> _btn_confirm;
+
+    custom_agent::Config _config;
+    std::vector<int> _length_levels;  // ms, 0.1 s steps
+    std::vector<int> _volume_levels;  // mean-abs amplitude steps
+    int32_t _pending_length_index = -1;
+    int32_t _pending_volume_index = -1;
+    bool _confirm_flag            = false;
+};
+
+/**
  * @brief
  *
  */
