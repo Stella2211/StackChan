@@ -28,6 +28,8 @@
 
 #include <mooncake_log.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
+#include <esp_bt.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
@@ -82,6 +84,15 @@ std::atomic<bool> g_turnComplete{false};
 std::atomic<bool> g_speakingShown{false};
 std::atomic<bool> g_needHeaderStrip{false};
 
+// Wake-word ("ハイ、スタックチャン") detection. DISABLED: it was not reliably triggering,
+// and more importantly the WakeNet AFE instance it requires holds ~25KB of *internal*
+// (DMA-capable) RAM permanently -- the exact pool WiFi/lwIP/WireGuard TX buffers need,
+// which bottomed out at session start and broke audio/the tunnel (see git history /
+// the HEAP[*] probes). Dropping it frees that ~25KB and de-fragments the DMA heap, which
+// is the actual fix for the no-audio/no-response bug. Sessions still start via screen tap
+// and head-pet. Flip back to true (and debug detection) once the RAM budget allows it.
+constexpr bool kWakeWordEnabled = false;
+
 // End the session after this much continuous post-playback silence (fixed, per spec).
 constexpr int kSessionIdleMs = 60'000;
 // AFE-VC OnOutput chunk size (OPUS_FRAME_DURATION_MS-equivalent). We do NOT Opus-encode;
@@ -121,6 +132,19 @@ static void faceStatus(const char* status)
 static void faceSpeech(const char* role, const char* content)
 {
     face()->SetChatMessage(role, content);
+}
+
+// Snapshot internal/DMA/PSRAM heap at a named point. Used to pinpoint which start()
+// init step drains internal (DMA-capable) RAM -- the pool WiFi/lwIP/WireGuard need and
+// that bottoms out at session start. Temporary diagnostic.
+static void log_heap(const char* where)
+{
+    mclog::tagWarn(_tag, "HEAP[{}] int_free={} int_max_blk={} dma_free={} dma_max_blk={} psram_free={}",
+                   where, (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                   (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                   (unsigned long)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                   (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                   (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -419,7 +443,8 @@ static void wire_callbacks()
         g_turnComplete  = false;
         g_speakingShown = false;
         faceStatus(Lang::Strings::STANDBY);
-        faceSpeech("system", "「ハイ、スタックチャン」と呼びかけるか画面をタップしてください");
+        faceSpeech("system", kWakeWordEnabled ? "「ハイ、スタックチャン」と呼びかけるか画面をタップしてください"
+                                              : "画面をタップして話しかけてください");
     };
 
     cb.onConnected = []() { mclog::tagInfo(_tag, "connected"); };
@@ -571,7 +596,29 @@ static void session_loop()
     std::vector<int16_t> frame;
     int idleMs = 0;
 
+    // Heap probe (temporary diagnostic). WiFi dynamic TX buffers + lwIP pbufs come
+    // from internal/DMA-capable RAM, so a send-time ENOMEM (e.g. "STUN send failed:
+    // 12") means INTERNAL RAM ran out -- not PSRAM. Log it every 5s so it interleaves
+    // with ml_derp's HEARTBEAT and shows the level *at the moment of failure*. The
+    // min_free water-mark catches a dip even if heap has recovered by the next print.
+    TickType_t lastHeapLog = 0;
+
     while (1) {
+        {
+            const TickType_t now = xTaskGetTickCount();
+            if ((now - lastHeapLog) * portTICK_PERIOD_MS >= 5000) {
+                lastHeapLog = now;
+                mclog::tagWarn(_tag,
+                               "HEAP int_free={} int_min={} int_max_blk={} dma_free={} dma_max_blk={} psram_free={}",
+                               (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                               (unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+                               (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                               (unsigned long)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                               (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                               (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            }
+        }
+
         // Reading paces this loop at ~one frame per kFrameMs (codec is real-time).
         // The frame is 16k with every input channel interleaved (mic + AEC-ref).
         if (!g_audio.captureFrame2ch16k(frame)) {
@@ -662,6 +709,22 @@ void start()
 {
     mclog::tagInfo(_tag, "start custom agent");
 
+    // Release BLE's reserved RAM. Agent mode never uses BLE (only the Dance app calls
+    // startBleServer; NimBLE is never initialized on this path) and agent mode is
+    // terminal (Mooncake is destroyed before we get here -- no path back to Dance
+    // without a reboot), so this is safe. NOTE: this only reclaims ~2KB in practice
+    // (the controller was never init'd, so there is little dynamic RAM to free) -- it is
+    // NOT the fix for the session-start internal-RAM collapse. The real drain is the
+    // ~160KB consumed by the init steps below (WiFi / microlink / AFE); the log_heap()
+    // probes there pinpoint it. Kept anyway as a cheap, safe reclaim.
+    {
+        const size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        const esp_err_t err = esp_bt_mem_release(ESP_BT_MODE_BLE);
+        const size_t after  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        mclog::tagWarn(_tag, "BT mem release: err={} int_free {} -> {} (+{} bytes)", (int)err,
+                       (unsigned long)before, (unsigned long)after, (unsigned long)(after - before));
+    }
+
     g_cfg = load_config();
 
     // Silence microlink's per-packet INFO logging. At INFO these tags emit ~3 lines
@@ -723,42 +786,53 @@ void start()
     // 4) Idle face while we connect.
     faceStatus(Lang::Strings::STANDBY);
 
+    log_heap("pre-net");
+
     // 5) Network (blocks until Wi-Fi is up; enters config mode if unprovisioned).
     faceSpeech("system", "ネットワーク接続中...");
     GetHAL().startNetwork([](std::string_view msg) { mclog::tagInfo(_tag, "net: {}", msg); });
+    log_heap("post-wifi");
 
     // 5b) Tailscale (MicroLink) tunnel, if provisioned. No-op AND silent otherwise
     //     (the status sink fires only on the enabled path). Makes a tailnet-only
     //     backend reachable; the WebSocket transport is unchanged because lwIP
     //     routes 100.64.0.0/10 through the WireGuard netif.
     tailscale_bring_up(g_cfg, [](const char* msg) { faceSpeech("system", msg); });
+    log_heap("post-tailscale");
 
     // 6) Audio I/O.
     if (!g_audio.init()) {
         faceSpeech("system", "オーディオ初期化失敗");
         mclog::tagError(_tag, "audio init failed");
     }
+    log_heap("post-audio");
 
-    // 6b) Speech engines. Load the ESP-SR models from the assets partition and bring
-    //      up both AFE instances (wake word for sleep, voice processing for an active
-    //      session). Each spawns its own internal task; we toggle them with Start/Stop
-    //      as the session opens and closes. If the models are missing we log and carry
-    //      on -- voice is disabled but the face / device tools still work.
+    // 6b) Speech engines. Load the ESP-SR models from the assets partition and bring up
+    //      the voice-processing AFE (NS + VAD + mono extraction) used during a session.
+    //      The wake-word AFE is created only when kWakeWordEnabled (currently off -- it
+    //      is the ~25KB internal-RAM hog behind the session-start memory collapse). With
+    //      it off, sessions start by tap / head-pet, the loop's g_wake guards no-op, and
+    //      the freed RAM keeps WiFi able to allocate TX buffers during audio streaming.
     g_models = load_sr_models();
+    log_heap("post-srmodels");
     AudioCodec* codec = Board::GetInstance().GetAudioCodec();
     if (g_models != nullptr && codec != nullptr) {
-        // Voice processor first: it only borrows g_models (reads NS/VAD model names)
-        // and never frees it. The wake engine is created second because
-        // ~AfeWakeWord esp_srmodel_deinit()s the shared list -- so if its Initialize
-        // fails we release() (leak the small zombie) instead of reset()ing, which
-        // would tear g_models out from under the voice processor mid-run.
+        // Voice processor: it only borrows g_models (reads NS/VAD model names) and never
+        // frees it.
         g_vc = std::make_unique<AfeAudioProcessor>();
         g_vc->Initialize(codec, kVcFrameMs, g_models);  // half-duplex: device AEC stays off
+        log_heap("post-vc-afe");
 
-        g_wake = std::make_unique<AfeWakeWord>();
-        if (!g_wake->Initialize(codec, g_models)) {
-            mclog::tagError(_tag, "wake word init failed; tap/head-pet start only");
-            g_wake.release();  // do NOT free the shared models that g_vc still uses
+        if (kWakeWordEnabled) {
+            // ~AfeWakeWord esp_srmodel_deinit()s the shared g_models list, so on init
+            // failure we release() (leak the small zombie) instead of reset()ing, which
+            // would tear g_models out from under the voice processor mid-run.
+            g_wake = std::make_unique<AfeWakeWord>();
+            if (!g_wake->Initialize(codec, g_models)) {
+                mclog::tagError(_tag, "wake word init failed; tap/head-pet start only");
+                g_wake.release();
+            }
+            log_heap("post-wake-afe");
         }
         wire_afe();
     } else {
@@ -775,8 +849,9 @@ void start()
         }
     });
 
-    // 7) Connect to the backend and wait for ready, then drop into the sleeping
-    //    (wake-word) state so we are immediately listening for a tap / wake word.
+    // 7) Connect to the backend and wait for ready, then drop into the sleeping state so
+    //    we are immediately ready for a session-start tap / head-pet (wake word too when
+    //    kWakeWordEnabled).
     connect_with_retry();
     enter_sleeping();
 
