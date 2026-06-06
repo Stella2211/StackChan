@@ -99,6 +99,27 @@ index 6627fd0..a290ab7 100644
  
  	switch (type) {
  		case MESSAGE_HANDSHAKE_INITIATION:
+diff --git a/components/microlink/include/microlink.h b/components/microlink/include/microlink.h
+index 9126a53..de32670 100644
+--- a/components/microlink/include/microlink.h
++++ b/components/microlink/include/microlink.h
+@@ -41,6 +41,16 @@ typedef struct {
+      * Set to 0 to disable (all peers treated equally). */
+     uint32_t priority_peer_ip;  /* VPN IP in host byte order (e.g., microlink_parse_ip("100.x.y.z")) */
+ 
++    /* DISCO/peer-table restriction: when true AND priority_peer_ip is set, only the
++     * priority peer is admitted to the peer table and DISCO-probed; every other
++     * tailnet peer is ignored (no WG slot, no outbound DISCO, no handshake). For
++     * single-peer deployments (a device that only ever talks to one backend) this
++     * stops the device from holding/probing the rest of the tailnet, eliminating the
++     * per-peer RAM and the DISCO/handshake control traffic that otherwise steals
++     * throughput from the data path. Inbound DISCO pings are still answered.
++     * No effect when priority_peer_ip == 0 (falls back to allow-all). */
++    bool disco_priority_only;
++
+     /* Optional timing overrides (0 = use defaults) */
+     uint32_t disco_heartbeat_ms;    /* DISCO keepalive interval (default: 3000) */
+     uint32_t stun_interval_ms;      /* STUN re-probe interval (default: 23000) */
 diff --git a/components/microlink/src/ml_derp.c b/components/microlink/src/ml_derp.c
 index c57fd0f..6748df6 100644
 --- a/components/microlink/src/ml_derp.c
@@ -121,3 +142,52 @@ index c57fd0f..6748df6 100644
      }
  
      ESP_LOGI(TAG, "DERP I/O task exiting");
+diff --git a/components/microlink/src/ml_wg_mgr.c b/components/microlink/src/ml_wg_mgr.c
+index ed40942..480da49 100644
+--- a/components/microlink/src/ml_wg_mgr.c
++++ b/components/microlink/src/ml_wg_mgr.c
+@@ -373,11 +373,27 @@ static int find_peer_by_disco_key(microlink_t *ml, const uint8_t *disco_key) {
+     return -1;
+ }
+ 
++/* Combined peer filter for both peer-table admission and DISCO probing.
++ * Layers the optional "priority only" mode on top of the httpd allowlist: when
++ * disco_priority_only is set (single-peer deployments that only talk to the
++ * priority peer), every peer other than the priority peer is filtered out so we
++ * stop holding/probing the rest of the tailnet — cutting both per-peer RAM and the
++ * DISCO/handshake control traffic that otherwise steals throughput from the data
++ * path. Disabled (allow-all) when priority_peer_ip == 0 so it can never strand a
++ * device with no admissible peers. */
++static inline bool ml_peer_allowed(microlink_t *ml, uint32_t vpn_ip) {
++    if (ml->config.disco_priority_only && ml->config.priority_peer_ip != 0 &&
++        vpn_ip != ml->config.priority_peer_ip) {
++        return false;
++    }
++    return ml_config_peer_is_allowed(ml->config_httpd, vpn_ip);
++}
++
+ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
+     /* Peer allowlist filter: don't waste WG slots on non-allowed peers.
+      * Still process updates for existing peers (they may become allowed later). */
+-    if (!ml_config_peer_is_allowed(ml->config_httpd, update->vpn_ip)) {
+-        return -1;  /* Silently skip — peer not in allowlist */
++    if (!ml_peer_allowed(ml, update->vpn_ip)) {
++        return -1;  /* Silently skip — peer not in allowlist / priority-only mode */
+     }
+ 
+     /* Check if peer already exists */
+@@ -1421,10 +1437,11 @@ static void disco_periodic_probes(microlink_t *ml) {
+         ml_peer_t *p = &ml->peers[i];
+         if (!p->active) continue;
+ 
+-        /* Peer allowlist filter: check early so we can skip expensive work.
++        /* Peer allowlist + priority-only filter: check early so we can skip expensive
++         * work. Also covers peers loaded from the NVS fast-boot cache (which bypass
++         * add_peer), so priority-only mode won't probe stale non-backend cache entries.
+          * Inbound DISCO pings from any peer are still answered (don't break remote). */
+-        bool peer_allowed = ml_config_peer_is_allowed(
+-            ml->config_httpd, p->vpn_ip);
++        bool peer_allowed = ml_peer_allowed(ml, p->vpn_ip);
+ 
+         /* Check if direct path trust has expired (always runs, not throttled) */
+         if (p->has_direct_path && now > p->trust_until_ms) {

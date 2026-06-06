@@ -141,9 +141,17 @@ bool tailscale_bring_up(const Config& cfg, const std::function<void(const char*)
     mlc.enable_derp       = true;
     mlc.enable_stun       = true;
     mlc.enable_disco      = true;
-    mlc.max_peers         = 16;  // hold the whole tailnet; avoids WG-slot eviction/reuse (see sdkconfig.defaults)
-    mlc.wifi_tx_power_dbm = 0;  // keep the board's default TX power
-    mlc.priority_peer_ip  = peerIpHost;
+    // We only ever talk to the backend (the priority peer). disco_priority_only makes
+    // microlink admit/probe ONLY that peer and ignore the rest of the tailnet, so a
+    // multi-device tailnet can't trigger a DISCO/handshake storm (+ peer-slot eviction
+    // thrashing) that drains internal RAM and preempts the audio RX path -> choppy TTS.
+    // max_peers stays at the full tailnet size on purpose: peers[] lives in PSRAM (no
+    // SRAM cost) and a small table risks the backend landing on a reused WG slot with
+    // stale handshake state -> backend handshake fails on boot (see sdkconfig.defaults).
+    mlc.max_peers          = 16;
+    mlc.disco_priority_only = (peerIpHost != 0);
+    mlc.wifi_tx_power_dbm  = 0;  // keep the board's default TX power
+    mlc.priority_peer_ip   = peerIpHost;
 
     mclog::tagInfo(_tag, "starting tailscale (device='{}' peer='{}')", g_ts.deviceName,
                    g_ts.peerIp.empty() ? "(none)" : g_ts.peerIp);
