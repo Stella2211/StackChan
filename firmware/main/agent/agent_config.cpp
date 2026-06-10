@@ -93,9 +93,24 @@ std::string build_ws_url(const Config& cfg)
     url += cfg.host;
     url += "/ws/";
     url += route_name(cfg.route);
+
+    // Query string: first param uses '?', the rest '&'.
+    char sep = '?';
     if (!cfg.token.empty()) {
-        url += "?token=";
+        url += sep;
+        sep = '&';
+        url += "token=";
         url += cfg.token;
+    }
+    // Request the Opus-compressed downlink on the agent route (VoiceVox path). The
+    // backend falls back to WAV if it doesn't support Opus, and the device picks the
+    // decode path from output.audio.start.mimeType, so this is safe both ways. The Live
+    // route streams native PCM and ignores the hint. ~8x less downlink than raw PCM --
+    // the fix for choppy audio on weak WiFi (see the SEG ratio>100% diagnostics).
+    if (cfg.route == Route::Agent) {
+        url += sep;
+        sep = '&';
+        url += "audio=opus";
     }
     return url;
 }

@@ -29,6 +29,7 @@
 #include <mooncake_log.h>
 #include <esp_log.h>
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
 #include <esp_bt.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -83,6 +84,20 @@ std::atomic<bool> g_closeRequested{false};  // server sent session.closed; loop 
 std::atomic<bool> g_turnComplete{false};
 std::atomic<bool> g_speakingShown{false};
 std::atomic<bool> g_needHeaderStrip{false};
+// Current downlink audio segment is Opus ("audio/opus") rather than raw PCM/WAV. Set on
+// output.audio.start, read on each binary frame. Both fire from the WS receive task.
+std::atomic<bool> g_audioIsOpus{false};
+
+// --- response-latency diagnostics (temporary) -------------------------------------
+// Anchored at input.audio.end (utterance committed); the WS-rx callbacks stamp the
+// first output.text / output.audio.start / first audio chunk relative to it, so the
+// "slow first audio" time is split into server think-time vs network transfer. The
+// AudioPipeline reports the matching firstPlay + per-segment throughput. Boundary-only
+// logging (a few lines per turn) -- never per chunk (that would throttle the WG path).
+std::atomic<int64_t> g_turnEndUs{0};
+std::atomic<bool> g_latText{false};
+std::atomic<bool> g_latAudioStart{false};
+std::atomic<bool> g_latChunk{false};
 
 // Per-turn capture gating (min volume + min duration), layered on top of the AFE's
 // model VAD. A candidate utterance (AFE onset) is buffered but NOT announced to the
@@ -507,6 +522,7 @@ static void start_session()
     g_sessionActive  = true;
     g_turnComplete   = false;
     g_speakingShown  = false;
+    g_turnEndUs.store(0);  // diagnostics: no utterance yet -> suppress latency for any greeting audio
     if (g_wake) {
         g_wake->Stop();
     }
@@ -584,6 +600,13 @@ static void wire_afe()
                     g_turnComplete  = false;
                     g_speakingShown = false;
                     g_state         = State::Responding;
+                    // diagnostics: anchor the response-latency clock at utterance end so the
+                    // rx callbacks below can time text / audio start / first chunk / first play.
+                    g_turnEndUs.store(esp_timer_get_time());
+                    g_latText.store(false);
+                    g_latAudioStart.store(false);
+                    g_latChunk.store(false);
+                    g_audio.noteTurnStart();
                     // Bridge the gap until the reply starts so it doesn't look stalled.
                     faceSpeech("system", "かんがえてるよ…");
                 } else {
@@ -691,9 +714,21 @@ static void wire_callbacks()
         }
     };
 
-    cb.onText = [](const std::string& text) { faceSpeech("assistant", text.c_str()); };
+    cb.onText = [](const std::string& text) {
+        const int64_t t0 = g_turnEndUs.load();
+        if (t0 > 0 && !g_latText.exchange(true)) {
+            mclog::tagInfo(_tag, "RESP text +{}ms", (long)((esp_timer_get_time() - t0) / 1000));
+        }
+        faceSpeech("assistant", text.c_str());
+    };
 
     cb.onAudioStart = [](const std::string& /*id*/, AudioMime mime) {
+        const int64_t t0 = g_turnEndUs.load();
+        if (t0 > 0 && !g_latAudioStart.exchange(true)) {
+            mclog::tagInfo(_tag, "RESP audio.start +{}ms", (long)((esp_timer_get_time() - t0) / 1000));
+        }
+        g_audio.beginSegment();  // diagnostics: bracket this server audio segment
+        g_audioIsOpus     = (mime == AudioMime::Opus);
         g_needHeaderStrip = (mime == AudioMime::Wav);
         // Go half-duplex for playback. Only force Responding from Listening; if we are
         // still Capturing, leave the Capturing->Responding transition to the AFE-VC
@@ -707,7 +742,14 @@ static void wire_callbacks()
     };
 
     cb.onAudioChunk = [](const uint8_t* data, size_t len) {
-        if (g_needHeaderStrip.exchange(false)) {
+        const int64_t t0 = g_turnEndUs.load();
+        if (t0 > 0 && !g_latChunk.exchange(true)) {
+            mclog::tagInfo(_tag, "RESP firstChunk +{}ms", (long)((esp_timer_get_time() - t0) / 1000));
+        }
+        if (g_audioIsOpus.load()) {
+            // "audio/opus": length-prefixed Opus packets; the pipeline decodes to PCM.
+            g_audio.enqueueOpusMessage(data, len);
+        } else if (g_needHeaderStrip.exchange(false)) {
             const size_t off = wav_data_offset(data, len);
             if (off < len) {
                 g_audio.enqueuePcm(data + off, len - off);
@@ -719,6 +761,7 @@ static void wire_callbacks()
 
     cb.onAudioEnd = [](const std::string& /*id*/) {
         // Segment boundary only; the next output.audio.start resets header strip.
+        g_audio.endSegment();  // diagnostics: log this segment's network/playback health
     };
 
     cb.onTurnComplete = []() { g_turnComplete = true; };

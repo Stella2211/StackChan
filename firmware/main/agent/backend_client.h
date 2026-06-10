@@ -26,6 +26,7 @@ enum class AudioMime : uint8_t {
     Unknown = 0,
     Pcm,
     Wav,
+    Opus,  // "audio/opus" (route2/agent, compressed downlink) -- length-prefixed Opus packets
 };
 
 /**

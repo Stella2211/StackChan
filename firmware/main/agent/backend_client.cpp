@@ -42,7 +42,10 @@ static AudioMime parse_mime(const char* mime)
     if (mime == nullptr) {
         return AudioMime::Unknown;
     }
-    // "audio/wav" -> Wav, "audio/pcm;rate=24000" -> Pcm
+    // "audio/wav" -> Wav, "audio/pcm;rate=24000" -> Pcm, "audio/opus" -> Opus
+    if (std::strstr(mime, "opus") != nullptr) {
+        return AudioMime::Opus;
+    }
     if (std::strstr(mime, "wav") != nullptr) {
         return AudioMime::Wav;
     }
